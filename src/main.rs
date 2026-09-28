@@ -13,6 +13,9 @@ fn main() {
     let mut max_codes_explicit = false;
     let mut temperature: f32 = 0.8;
     let mut top_k: usize = 50;
+    let mut top_p: f32 = 1.0;
+    let mut onset_frames: usize = 0;
+    let mut onset_temperature: f32 = 0.3;
     let mut seed: Option<u64> = None;
     let exe_dir = std::env::current_exe()
         .expect("Cannot determine executable path")
@@ -71,6 +74,24 @@ fn main() {
             "--top-k" => {
                 if i + 1 < args.len() {
                     top_k = args[i + 1].parse().unwrap_or(50);
+                    i += 1;
+                }
+            }
+            "--top-p" => {
+                if i + 1 < args.len() {
+                    top_p = args[i + 1].parse().unwrap_or(1.0);
+                    i += 1;
+                }
+            }
+            "--onset-frames" => {
+                if i + 1 < args.len() {
+                    onset_frames = args[i + 1].parse().unwrap_or(0);
+                    i += 1;
+                }
+            }
+            "--onset-temperature" => {
+                if i + 1 < args.len() {
+                    onset_temperature = args[i + 1].parse().unwrap_or(0.3);
                     i += 1;
                 }
             }
@@ -268,8 +289,11 @@ fn main() {
     let tokenizer = qora_tts::tokenizer::TTSTokenizer::from_file(&tokenizer_path)
         .expect("Failed to load tokenizer");
 
-    eprintln!("Temperature: {temperature}, Top-K: {top_k}, Seed: {}",
+    eprintln!("Temperature: {temperature}, Top-K: {top_k}, Top-P: {top_p}, Seed: {}",
         seed.map(|s| s.to_string()).unwrap_or("random".into()));
+    if onset_frames > 0 {
+        eprintln!("Onset schedule: first {onset_frames} frames at temperature {onset_temperature}");
+    }
 
     // Load reference audio once (auto-resampled to 24kHz mono) for both
     // the speaker embedding and, in ICL mode, the codec encoder.
@@ -463,9 +487,12 @@ fn main() {
                 max_codes,
                 temperature,
                 top_k,
+                top_p,
                 repetition_penalty: 1.05,
                 codec_eos_id: 2150,
                 codec_bos_id: 2149,
+                onset_frames,
+                onset_temperature,
             },
             chunk_seed,
             ref_text_tokens.clone(),

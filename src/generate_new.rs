@@ -39,9 +39,15 @@ pub struct TTSParams {
     pub max_codes: usize,
     pub temperature: f32,
     pub top_k: usize,
+    pub top_p: f32,
     pub repetition_penalty: f32,
     pub codec_eos_id: u32,
     pub codec_bos_id: u32,
+    /// Onset guard: first `onset_frames` frames of each chunk sample with
+    /// `onset_temperature` (chunk attacks have the widest first-draw entropy
+    /// and collect most roughness defects). 0 = off.
+    pub onset_frames: usize,
+    pub onset_temperature: f32,
 }
 
 impl Default for TTSParams {
@@ -50,10 +56,22 @@ impl Default for TTSParams {
             max_codes: 1000,
             temperature: 0.9,
             top_k: 50,
+            top_p: 1.0,
             repetition_penalty: 1.05,
             codec_eos_id: CODEC_EOS,
             codec_bos_id: CODEC_BOS,
+            onset_frames: 0,
+            onset_temperature: 0.3,
         }
+    }
+}
+
+/// Effective sampling temperature for a frame (onset schedule).
+pub fn frame_temperature(params: &TTSParams, frame_idx: usize) -> f32 {
+    if frame_idx < params.onset_frames {
+        params.onset_temperature
+    } else {
+        params.temperature
     }
 }
 
@@ -370,8 +388,9 @@ pub fn generate_speech(
     let t_gen = Instant::now();
 
     for frame_idx in 0..params.max_codes {
-        // Sample semantic token from logits
-        let semantic_token = sample_token(&logits, params, &prev_tokens, &mut rng_state);
+        // Sample semantic token from logits (onset schedule for chunk attacks)
+        let eff_temp = frame_temperature(params, frame_idx);
+        let semantic_token = sample_token(&logits, params, &prev_tokens, &mut rng_state, eff_temp);
 
         if semantic_token == params.codec_eos_id {
             eprintln!("EOS at frame {}", frame_idx);
@@ -482,8 +501,9 @@ fn build_trailing_text(talker: &TalkerWeights, text_tokens: &[u32]) -> Vec<Vec<f
     trailing
 }
 
-/// Sample next token with temperature, top-k, and repetition penalty
-fn sample_token(logits: &[f32], params: &TTSParams, prev_tokens: &[u32], rng: &mut u64) -> u32 {
+/// Sample next token with temperature, top-k, top-p, and repetition penalty.
+/// `temperature` is passed per-frame (onset schedule); the rest from params.
+fn sample_token(logits: &[f32], params: &TTSParams, prev_tokens: &[u32], rng: &mut u64, temperature: f32) -> u32 {
     let mut scores = logits.to_vec();
 
     // Apply repetition penalty
@@ -500,9 +520,9 @@ fn sample_token(logits: &[f32], params: &TTSParams, prev_tokens: &[u32], rng: &m
     }
 
     // Apply temperature
-    if params.temperature != 1.0 {
+    if temperature != 1.0 && temperature > 0.0 {
         for s in &mut scores {
-            *s /= params.temperature;
+            *s /= temperature;
         }
     }
 
@@ -522,6 +542,35 @@ fn sample_token(logits: &[f32], params: &TTSParams, prev_tokens: &[u32], rng: &m
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
         for (i, _) in indexed.iter().skip(params.top_k) {
+            scores[*i] = 0.0;
+        }
+
+        // Renormalize
+        let sum: f32 = scores.iter().sum();
+        if sum > 0.0 {
+            for s in &mut scores {
+                *s /= sum;
+            }
+        }
+    }
+
+    // Top-p (nucleus) filtering: keep smallest set with cumulative mass >= top_p
+    // (always keeps the argmax). top_p >= 1.0 or <= 0.0 = off.
+    if params.top_p > 0.0 && params.top_p < 1.0 {
+        let mut indexed: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        let mut cum = 0.0f32;
+        let mut cutoff = indexed.len();
+        for (rank, &(_, p)) in indexed.iter().enumerate() {
+            cum += p;
+            if cum >= params.top_p {
+                cutoff = rank + 1;
+                break;
+            }
+        }
+        let cutoff = cutoff.max(1);
+        for (i, _) in indexed.iter().skip(cutoff) {
             scores[*i] = 0.0;
         }
 
@@ -583,6 +632,73 @@ mod tests {
         let l = icl_block_layout(1, 1, 23);
         assert_eq!(l.icl_len, 24);
         assert_eq!(l.remainder_len, 0);
+    }
+
+    fn test_params_top_p(top_p: f32) -> TTSParams {
+        TTSParams {
+            max_codes: 10,
+            temperature: 1.0,
+            top_k: 0,
+            top_p,
+            repetition_penalty: 1.0,
+            codec_eos_id: CODEC_EOS,
+            codec_bos_id: CODEC_BOS,
+            onset_frames: 0,
+            onset_temperature: 0.3,
+        }
+    }
+
+    #[test]
+    fn test_top_p_off_by_default() {
+        // top_p=1.0 (and <=0) must not filter: every token still reachable
+        let logits = vec![2.0, 1.0, 0.5, 0.1];
+        for tp in [1.0, 0.0, -0.5, 2.0] {
+            let p = test_params_top_p(tp);
+            // try many rng states; all 4 tokens must be drawable
+            let mut seen = [false; 4];
+            let mut rng: u64 = 12345;
+            for _ in 0..200 {
+                let t = sample_token(&logits, &p, &[], &mut rng, 1.0);
+                seen[t as usize] = true;
+            }
+            assert!(seen.iter().all(|&s| s), "top_p={tp}: all tokens reachable");
+        }
+    }
+
+    #[test]
+    fn test_top_p_cuts_tail() {
+        // logits [5,1,1,1] @ temp 1: top token p ≈ 0.93; top_p=0.5 keeps only it
+        let logits = vec![5.0, 1.0, 1.0, 1.0];
+        let p = test_params_top_p(0.5);
+        let mut rng: u64 = 999;
+        for _ in 0..50 {
+            assert_eq!(sample_token(&logits, &p, &[], &mut rng, 1.0), 0);
+        }
+    }
+
+    #[test]
+    fn test_top_p_keeps_argmax_always() {
+        // even tiny top_p keeps at least the argmax (cutoff.max(1))
+        let logits = vec![3.0, 2.9, 2.8];
+        let p = test_params_top_p(0.01);
+        let mut rng: u64 = 7;
+        for _ in 0..20 {
+            assert_eq!(sample_token(&logits, &p, &[], &mut rng, 1.0), 0);
+        }
+    }
+
+    #[test]
+    fn test_frame_temperature_schedule() {
+        let mut p = TTSParams::default();
+        p.temperature = 0.8;
+        p.onset_frames = 8;
+        p.onset_temperature = 0.3;
+        assert_eq!(frame_temperature(&p, 0), 0.3);
+        assert_eq!(frame_temperature(&p, 7), 0.3);
+        assert_eq!(frame_temperature(&p, 8), 0.8);
+        assert_eq!(frame_temperature(&p, 500), 0.8);
+        p.onset_frames = 0;
+        assert_eq!(frame_temperature(&p, 0), 0.8); // off by default
     }
 }
 

@@ -160,6 +160,8 @@ System: 16384 MB RAM (9856 MB free), 12 threads
 | `--temperature <f>` | 0.8 | Sampling temperature |
 | `--top-k <n>` | 50 | Top-K sampling |
 | `--seed <n>` | random | Random seed for reproducibility (printed each run) |
+| `--top-p <f>` | 1.0 (off) | Nucleus sampling: keep smallest set with cumulative mass ≥ p (cuts sampling tail; onset-roughness tool) |
+| `--onset-frames <n>` / `--onset-temperature <f>` | 0 / 0.3 | First n frames of each chunk sample at the given temperature (chunk-attack guard; off by default) |
 
 ### Clone modes
 
