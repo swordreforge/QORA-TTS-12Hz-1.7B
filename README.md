@@ -232,12 +232,14 @@ threading threshold.
 |-------|-----------|-------|-------------|
 | generic release | 60.4s (1.78s/frame) | 77.4s | — |
 | `RUSTFLAGS="-C target-cpu=native"` | 56.0s | 73.6s | -5% total |
-| native + persistent GEMV thread pool | **41.0s (1.21s/frame)** | **58.1s** | **-25% total** |
+| native + persistent GEMV thread pool | 41.0s (1.21s/frame) | 58.1s | -25% total |
+| native + pool + hand-written AVX2 Q4 kernel | **25.9s (0.76s/frame)** | **42.1s** | **-46% total** |
 
-All three produce bit-identical audio for the same seed (verified by sha256).
+All four produce bit-identical audio for the same seed (verified by sha256).
 The pool (22 persistent workers, no per-call spawn) also lowered the threading
-threshold so predictor GEMVs parallelize. Remaining headroom: hand-written AVX2
-Q4 kernel (this CPU has no AVX-512, so the AVX-512 fast path never fires).
+threshold so predictor GEMVs parallelize. The AVX2 kernel (`simd::gemv_q4_avx2`,
+8-wide LUT via split `permutevar8x32`+blend) is runtime-dispatched below AVX-512;
+differential tests assert bit-exact equality with the scalar oracle.
 
 ## Comparison with 0.6B
 

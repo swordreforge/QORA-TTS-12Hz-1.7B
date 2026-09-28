@@ -1,8 +1,13 @@
-# AVX2 Q4 kernel 实施方案（只规划，不写码）
+# AVX2 Q4 kernel 实施方案（✅ 已实现，2026-09-28）
 
 > 背景：`perf` 实测 generation 98% 周期烧在标量 `gemv_q4_inner`；
 > 本机（Ultra 7 155H）无 AVX-512，`simd.rs` 的加速分支永远进不去。
 > 目标：8-wide AVX2 kernel，把单线程吞吐翻 ~2x，再与线程池乘法叠加。
+>
+> 结果：generation 41.0s → 25.9s（0.76s/frame），total 58.1s → 42.1s；
+> 同 seed sha256 与之前三版完全一致。实现与本方案一致，两处 Abweichungen：
+> 门控取纯 `avx2`（未绑 fma，kernel 内只用 mul/add）；n 非 32 倍数的尾巴
+> 与标量版同样留零（不另行处理）。
 
 ---
 

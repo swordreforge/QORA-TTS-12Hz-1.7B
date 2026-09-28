@@ -232,6 +232,19 @@ fn gemv_q4_inner(input: &[f32], packed: &[u8], scales: &[f16],
     if crate::simd::has_avx512() {
         return unsafe { crate::simd::gemv_q4_avx512(input, packed, scales, n, k_start, k_end) };
     }
+    // AVX2 fast path
+    if crate::simd::has_avx2() {
+        return unsafe { crate::simd::gemv_q4_avx2(input, packed, scales, n, k_start, k_end) };
+    }
+    gemv_q4_scalar(input, packed, scales, n, k_start, k_end)
+}
+
+/// Scalar Q4 GEMV reference. This is the bit-exact oracle for the SIMD
+/// kernels: same loop order, same FP op sequence. Differential tests assert
+/// `avx2 == scalar` element-wise (not approximate).
+#[inline]
+fn gemv_q4_scalar(input: &[f32], packed: &[u8], scales: &[f16],
+                  n: usize, k_start: usize, k_end: usize) -> Vec<f32> {
     let groups_per_row = n / Q4_GROUP_SIZE;
     let packed_per_group = Q4_GROUP_SIZE / 2;
     let packed_per_row = groups_per_row * packed_per_group;
@@ -659,5 +672,148 @@ pub fn read_weight_io(r: &mut impl std::io::Read, format_id: u8) -> std::io::Res
             Ok(Weight::Q4(Q4Weight { packed, scales, k, n }))
         }
         _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unknown format"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn xrng(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    fn rbytes(state: &mut u64, n: usize) -> Vec<u8> {
+        (0..n).map(|_| (xrng(state) & 0xFF) as u8).collect()
+    }
+
+    fn rscales(state: &mut u64, n: usize, zero_frac: f64) -> Vec<f16> {
+        (0..n)
+            .map(|_| {
+                let r = (xrng(state) % 1000) as f64 / 1000.0;
+                if r < zero_frac {
+                    f16::from_f32(0.0)
+                } else {
+                    // small magnitudes incl. negatives and subnormals-adjacent
+                    let v = ((xrng(state) % 2000) as f32 / 1000.0 - 1.0) * 0.05;
+                    f16::from_f32(v)
+                }
+            })
+            .collect()
+    }
+
+    fn rinput(state: &mut u64, n: usize, zero_frac: f64) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                let r = (xrng(state) % 1000) as f64 / 1000.0;
+                if r < zero_frac {
+                    0.0
+                } else {
+                    ((xrng(state) % 2000) as f32 / 1000.0 - 1.0) * 2.0
+                }
+            })
+            .collect()
+    }
+
+    /// Run scalar oracle vs AVX2 kernel on one synthetic case, assert
+    /// bit-exact equality (same FP op sequence by construction).
+    #[cfg(target_arch = "x86_64")]
+    fn check_case(k: usize, n: usize, seed: u64, in_zero: f64, sc_zero: f64) {
+        if !crate::simd::has_avx2() {
+            eprintln!("no AVX2, skipping differential test");
+            return;
+        }
+        let mut st = seed;
+        let groups = n / Q4_GROUP_SIZE;
+        let packed = rbytes(&mut st, k * groups * (Q4_GROUP_SIZE / 2));
+        let scales = rscales(&mut st, k * groups, sc_zero);
+        let input = rinput(&mut st, k, in_zero);
+        let expect = gemv_q4_scalar(&input, &packed, &scales, n, 0, k);
+        let got = unsafe { crate::simd::gemv_q4_avx2(&input, &packed, &scales, n, 0, k) };
+        assert_eq!(got.len(), expect.len(), "len k={k} n={n}");
+        for (i, (a, b)) in got.iter().zip(expect.iter()).enumerate() {
+            assert!(
+                a.to_bits() == b.to_bits(),
+                "bit mismatch k={k} n={n} seed={seed} [{i}]: got {a:?} want {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_avx2_matches_scalar_shapes() {
+        // talker q (2048x2048) and mlp (2048x6144) shapes, predictor 1024x1024
+        check_case(64, 2048, 1, 0.0, 0.0);
+        check_case(64, 6144, 2, 0.0, 0.0);
+        check_case(32, 1024, 3, 0.0, 0.0);
+        check_case(16, 256, 4, 0.0, 0.0);
+        check_case(1, 32, 5, 0.0, 0.0); // single row, single group
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_avx2_matches_scalar_sparse() {
+        // zero-skipping paths (input==0, scale==0), incl. negative scales
+        check_case(48, 1024, 11, 0.3, 0.2);
+        check_case(32, 2048, 12, 0.5, 0.5);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_avx2_subrange_matches() {
+        // k-chunk path used by the thread pool must agree per chunk
+        if !crate::simd::has_avx2() {
+            return;
+        }
+        let mut st = 21;
+        let (k, n) = (64, 1024);
+        let groups = n / Q4_GROUP_SIZE;
+        let packed = rbytes(&mut st, k * groups * (Q4_GROUP_SIZE / 2));
+        let scales = rscales(&mut st, k * groups, 0.1);
+        let input = rinput(&mut st, k, 0.1);
+        let full = gemv_q4_scalar(&input, &packed, &scales, n, 0, k);
+        let mut acc = vec![0.0f32; n];
+        for (a, b) in [(0, 16), (16, 48), (48, 64)] {
+            let part = unsafe { crate::simd::gemv_q4_avx2(&input, &packed, &scales, n, a, b) };
+            for j in 0..n {
+                acc[j] += part[j];
+            }
+        }
+        // NOTE: chunked accumulation order differs from single-pass, so compare
+        // against chunked scalar accumulation (same op order), not `full`.
+        let mut acc_ref = vec![0.0f32; n];
+        for (a, b) in [(0, 16), (16, 48), (48, 64)] {
+            let part = gemv_q4_scalar(&input, &packed, &scales, n, a, b);
+            for j in 0..n {
+                acc_ref[j] += part[j];
+            }
+        }
+        assert_eq!(acc, acc_ref);
+        // sanity: chunked ≈ full within float tolerance
+        for (a, b) in acc.iter().zip(full.iter()) {
+            assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_avx2_tail_n() {
+        // n not a multiple of 32: full groups agree, remainder stays zero
+        if !crate::simd::has_avx2() {
+            return;
+        }
+        let mut st = 31;
+        let (k, n) = (16, 100); // 3 full groups (96) + 4 untouched
+        let groups = n / Q4_GROUP_SIZE;
+        let packed = rbytes(&mut st, k * groups * (Q4_GROUP_SIZE / 2));
+        let scales = rscales(&mut st, k * groups, 0.0);
+        let input = rinput(&mut st, k, 0.0);
+        let expect = gemv_q4_scalar(&input, &packed, &scales, n, 0, k);
+        let got = unsafe { crate::simd::gemv_q4_avx2(&input, &packed, &scales, n, 0, k) };
+        assert_eq!(got, expect);
+        assert!(got[96..].iter().all(|&v| v == 0.0));
     }
 }

@@ -26,6 +26,121 @@ pub fn has_avx512() -> bool {
     }
 }
 
+/// Check if AVX2 is available at runtime.
+pub fn has_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+// ============================================================
+// Q4 GEMV — AVX2 (8-wide)
+// ============================================================
+
+/// AVX2 Q4 GEMV inner kernel. Bit-exact mirror of the scalar reference
+/// (`gemv_q4_scalar` in gemv.rs): same loop order, same FP op sequence
+/// (`lut[i] = s * (i - 8)` per lane, k-major `output[j] += …` accumulation).
+///
+/// Per group of 32 outputs, two 8-wide iterations handle 8 packed bytes
+/// (16 values) each. The 16-entry LUT is split in halves for
+/// `_mm256_permutevar8x32_ps` (which indexes modulo 8); lanes with
+/// `idx > 7` blend in the high half. Out-of-range indices never fault
+/// (hardware masks to 3 bits); the blend mask selects the correct half.
+///
+/// Only full groups are vectorized (`groups_per_row = n / 32`); a short tail
+/// (n not a multiple of 32) is left as zeros, exactly like the scalar path.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn gemv_q4_avx2(
+    input: &[f32],
+    packed: &[u8],
+    scales: &[f16],
+    n: usize,
+    k_start: usize,
+    k_end: usize,
+) -> Vec<f32> {
+    let groups_per_row = n / Q4_GROUP_SIZE;
+    let packed_per_group = Q4_GROUP_SIZE / 2; // 16
+    let packed_per_row = groups_per_row * packed_per_group;
+
+    let mut output = vec![0.0f32; n];
+
+    // LUT factor halves: (q - 8) for q = 0..8 and 8..16
+    let factors_lo = _mm256_loadu_ps(Q4_FACTORS.as_ptr());
+    let factors_hi = _mm256_loadu_ps(Q4_FACTORS.as_ptr().add(8));
+    let nibble_mask = _mm256_set1_epi32(0x0F);
+    let seven = _mm256_set1_epi32(7);
+
+    for ki in k_start..k_end {
+        let val = input[ki];
+        if val == 0.0 {
+            continue;
+        }
+
+        let scale_base = ki * groups_per_row;
+        let pack_base = ki * packed_per_row;
+
+        for g in 0..groups_per_row {
+            let s = scales[scale_base + g].to_f32() * val;
+            if s == 0.0 {
+                continue;
+            }
+
+            // Build LUT halves: lut[i] = s * (i - 8)
+            let s_vec = _mm256_set1_ps(s);
+            let lut0 = _mm256_mul_ps(factors_lo, s_vec);
+            let lut1 = _mm256_mul_ps(factors_hi, s_vec);
+
+            // 16 packed bytes cover 32 outputs; process 8 bytes (16 outs) at a time
+            let po = pack_base + g * packed_per_group;
+            let bytes = _mm_loadu_si128(packed.as_ptr().add(po) as *const __m128i);
+
+            for h in 0..2 {
+                let half = if h == 0 { bytes } else { _mm_srli_si128::<8>(bytes) };
+                // 8 bytes -> 8 u32 lanes
+                let v8 = _mm256_cvtepu8_epi32(half);
+                let lo = _mm256_and_si256(v8, nibble_mask);
+                let hi = _mm256_srli_epi32::<4>(v8);
+
+                // 16-entry lookup via two 8-entry permutes + blend on idx > 7
+                let lo0 = _mm256_permutevar8x32_ps(lut0, lo);
+                let lo1 = _mm256_permutevar8x32_ps(lut1, lo);
+                let lo_m = _mm256_cmpgt_epi32(lo, seven);
+                let lo_v = _mm256_blendv_ps(lo0, lo1, _mm256_castsi256_ps(lo_m));
+
+                let hi0 = _mm256_permutevar8x32_ps(lut0, hi);
+                let hi1 = _mm256_permutevar8x32_ps(lut1, hi);
+                let hi_m = _mm256_cmpgt_epi32(hi, seven);
+                let hi_v = _mm256_blendv_ps(hi0, hi1, _mm256_castsi256_ps(hi_m));
+
+                // Interleave: out[2i] = lo[i], out[2i+1] = hi[i].
+                // NOTE: unpack is lane-local (128-bit lanes), so a lane
+                // cross via permute2f128 is required for linear order.
+                let a = _mm256_unpacklo_ps(lo_v, hi_v);
+                let b = _mm256_unpackhi_ps(lo_v, hi_v);
+                let first = _mm256_permute2f128_ps(a, b, 0x20);
+                let second = _mm256_permute2f128_ps(a, b, 0x31);
+
+                let oo = g * Q4_GROUP_SIZE + h * 16;
+                let acc1 = _mm256_loadu_ps(output.as_ptr().add(oo));
+                _mm256_storeu_ps(output.as_mut_ptr().add(oo), _mm256_add_ps(acc1, first));
+                let acc2 = _mm256_loadu_ps(output.as_ptr().add(oo + 8));
+                _mm256_storeu_ps(
+                    output.as_mut_ptr().add(oo + 8),
+                    _mm256_add_ps(acc2, second),
+                );
+            }
+        }
+    }
+
+    output
+}
+
 // ============================================================
 // AVX-512 helper
 // ============================================================
