@@ -52,6 +52,18 @@ RVQ `num_quantizers=32`、`encoder_valid_num_quantizers=16`、`num_semantic_quan
 - 用其中 decoder 权重与现有 `model.qora-tts` 内 decoder 做交叉验证（同名 tensor 逐个比对
   shape/均值），确认权重来源一致后再动 encoder。
 
+> ✅ 已验证（2026-09-28，脚本 `/tmp/opencode/a1_inventory.py` 全过）：
+> `model.safetensors` 651MB，sha256 `836b7b35…571258`，496 tensors 全 F32，
+> encoder 225 / decoder 271，无 weight_norm。
+> decoder 侧 17 个 `src/loader.rs` 字面 key + 4 组 prefix（含 15 层 rvq_rest）全部命中，
+> 与现有二进制兼容。
+> encoder 侧键名为 V2 嵌套布局（`encoder.encoder.*` / `encoder.encoder_transformer.*` /
+> `encoder.downsample.*` / `encoder.quantizer.{semantic,acoustic}_residual_vector_quantizer.*`），
+> 关键 shape 全对：首 conv [64,1,7]、downsample [512,512,4] 无 bias、
+> 码本 embed_sum [2048,256]、semantic RVQ 1 层 / acoustic 31 层 / transformer 8 层。
+> ⚠️ 注意 encoder 码本键是 Mimi 风格 `codebook.embed_sum`，与 decoder 侧
+> `_codebook.embedding_sum` 命名不同，loader 不可混用。
+
 ### A2. 官方源码精读清单（按顺序，带着问题读）
 1. **`generate_icl_prompt` 完整函数体**（最高优先级，之前只见到调用）：
    `ref_id=input_id[:, 3:-2]` 切片语义、`ref_code` 如何转 embedding、
