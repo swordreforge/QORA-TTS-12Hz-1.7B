@@ -86,11 +86,14 @@ pub unsafe fn gemv_q4_avx2(
 
     let mut output = vec![0.0f32; n];
 
-    // LUT factor halves: (q - 8) for q = 0..8 and 8..16
-    let factors_lo = _mm256_loadu_ps(Q4_FACTORS.as_ptr());
-    let factors_hi = _mm256_loadu_ps(Q4_FACTORS.as_ptr().add(8));
+    // Integer-arithmetic LUT: dequant value = (nibble - 8) * s, computed as
+    // cvt(nibble) -> sub(8.0) -> mul(s). Bit-identical to the split-table
+    // permutevar version: cvt/sub are exact for 0..15, and IEEE mul commutes
+    // bitwise (a*b == b*a), so (i-8)*s == s*(i-8) lane for lane. This removes
+    // 4 permutevar + 2 cmpgt + 2 blendv per 16 outputs (all port-5 pressure
+    // on Intel) at the cost of 2 cvt + 2 sub + 2 mul on spread ports.
     let nibble_mask = _mm256_set1_epi32(0x0F);
-    let seven = _mm256_set1_epi32(7);
+    let eight = _mm256_set1_ps(8.0);
 
     for ki in k_start..k_end {
         let val = input[ki];
@@ -107,10 +110,8 @@ pub unsafe fn gemv_q4_avx2(
                 continue;
             }
 
-            // Build LUT halves: lut[i] = s * (i - 8)
+            // Build once per group: broadcast scale (LUT folded into lanes below)
             let s_vec = _mm256_set1_ps(s);
-            let lut0 = _mm256_mul_ps(factors_lo, s_vec);
-            let lut1 = _mm256_mul_ps(factors_hi, s_vec);
 
             // 16 packed bytes cover 32 outputs; process 8 bytes (16 outs) at a time
             let po = pack_base + g * packed_per_group;
@@ -123,16 +124,9 @@ pub unsafe fn gemv_q4_avx2(
                 let lo = _mm256_and_si256(v8, nibble_mask);
                 let hi = _mm256_srli_epi32::<4>(v8);
 
-                // 16-entry lookup via two 8-entry permutes + blend on idx > 7
-                let lo0 = _mm256_permutevar8x32_ps(lut0, lo);
-                let lo1 = _mm256_permutevar8x32_ps(lut1, lo);
-                let lo_m = _mm256_cmpgt_epi32(lo, seven);
-                let lo_v = _mm256_blendv_ps(lo0, lo1, _mm256_castsi256_ps(lo_m));
-
-                let hi0 = _mm256_permutevar8x32_ps(lut0, hi);
-                let hi1 = _mm256_permutevar8x32_ps(lut1, hi);
-                let hi_m = _mm256_cmpgt_epi32(hi, seven);
-                let hi_v = _mm256_blendv_ps(hi0, hi1, _mm256_castsi256_ps(hi_m));
+                // (nibble - 8) * s per lane; bit-identical to LUT (see above)
+                let lo_v = _mm256_mul_ps(_mm256_sub_ps(_mm256_cvtepi32_ps(lo), eight), s_vec);
+                let hi_v = _mm256_mul_ps(_mm256_sub_ps(_mm256_cvtepi32_ps(hi), eight), s_vec);
 
                 // Interleave: out[2i] = lo[i], out[2i+1] = hi[i].
                 // NOTE: unpack is lane-local (128-bit lanes), so a lane
