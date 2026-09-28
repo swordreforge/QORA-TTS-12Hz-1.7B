@@ -147,8 +147,32 @@ pub fn causal_conv1d(input: &[f32], w: &Conv1dWeight) -> Vec<f32> {
     output
 }
 
+/// Dispatch: AVX2 vectorized range when available, scalar oracle otherwise.
+/// Both produce bit-identical output (mul+add op sequence preserved per
+/// output element); see differential tests in `tests` module below.
 #[inline]
 fn causal_conv1d_range(
+    input: &[f32], w: &Conv1dWeight,
+    oc_start: usize, oc_end: usize,
+    in_len: usize, out_len: usize,
+    output: &mut [f32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::has_avx2() {
+        unsafe {
+            crate::simd::causal_conv1d_range_avx2(
+                input, &w.weight, &w.bias,
+                w.in_channels, w.kernel_size, w.dilation,
+                oc_start, oc_end, in_len, out_len, output,
+            );
+        }
+        return;
+    }
+    causal_conv1d_range_scalar(input, w, oc_start, oc_end, in_len, out_len, output);
+}
+
+#[inline]
+fn causal_conv1d_range_scalar(
     input: &[f32], w: &Conv1dWeight,
     oc_start: usize, oc_end: usize,
     in_len: usize, out_len: usize,
@@ -452,4 +476,100 @@ pub fn group_norm(
 #[inline]
 pub fn gelu(x: f32) -> f32 {
     x * 0.5 * (1.0 + (x * 0.7071067811865476).tanh())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn xrng(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    fn rvec(state: &mut u64, n: usize, mag: f32) -> Vec<f32> {
+        (0..n)
+            .map(|_| ((xrng(state) % 2000) as f32 / 1000.0 - 1.0) * mag)
+            .collect()
+    }
+
+    fn mkconv(state: &mut u64, oc: usize, ic: usize, k: usize, d: usize) -> Conv1dWeight {
+        Conv1dWeight {
+            weight: rvec(state, oc * ic * k, 0.5),
+            bias: rvec(state, oc, 0.1),
+            in_channels: ic,
+            out_channels: oc,
+            kernel_size: k,
+            stride: 1,
+            padding: 0,
+            dilation: d,
+        }
+    }
+
+    /// Scalar oracle vs AVX2 range kernel, bit-exact.
+    #[cfg(target_arch = "x86_64")]
+    fn check_conv(oc: usize, ic: usize, k: usize, d: usize, len: usize, seed: u64) {
+        if !crate::simd::has_avx2() {
+            eprintln!("no AVX2, skipping");
+            return;
+        }
+        let mut st = seed;
+        let w = mkconv(&mut st, oc, ic, k, d);
+        let input = rvec(&mut st, ic * len, 1.0);
+        let mut expect = vec![0.0f32; oc * len];
+        causal_conv1d_range_scalar(&input, &w, 0, oc, len, len, &mut expect);
+        let mut got = vec![0.0f32; oc * len];
+        unsafe {
+            crate::simd::causal_conv1d_range_avx2(
+                &input, &w.weight, &w.bias, ic, k, d, 0, oc, len, len, &mut got,
+            );
+        }
+        assert_eq!(got.len(), expect.len());
+        for (i, (a, b)) in got.iter().zip(expect.iter()).enumerate() {
+            assert!(
+                a.to_bits() == b.to_bits(),
+                "bit mismatch oc={oc} ic={ic} k={k} d={d} len={len} [{i}]: {a:?} vs {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_causal_avx2_shapes() {
+        check_conv(4, 4, 3, 1, 33, 1); // non-8 length: edge paths
+        check_conv(8, 16, 7, 1, 100, 2); // vocos-init-like k=7
+        check_conv(2, 2, 1, 1, 17, 3); // k=1, zero pad
+        check_conv(16, 32, 3, 1, 200, 4); // wider
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_causal_avx2_dilation() {
+        check_conv(4, 8, 3, 2, 64, 11);
+        check_conv(4, 4, 3, 4, 65, 12); // odd length + dilation
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_causal_avx2_subrange() {
+        // oc sub-range (thread-pool chunking) agrees with scalar sub-range
+        if !crate::simd::has_avx2() {
+            return;
+        }
+        let mut st = 21;
+        let (oc, ic, k, d, len) = (8, 8, 3, 1, 48);
+        let w = mkconv(&mut st, oc, ic, k, d);
+        let input = rvec(&mut st, ic * len, 1.0);
+        let mut expect = vec![0.0f32; 4 * len];
+        causal_conv1d_range_scalar(&input, &w, 2, 6, len, len, &mut expect);
+        let mut got = vec![0.0f32; 4 * len];
+        unsafe {
+            crate::simd::causal_conv1d_range_avx2(
+                &input, &w.weight, &w.bias, ic, k, d, 2, 6, len, len, &mut got,
+            );
+        }
+        assert_eq!(got, expect);
+    }
 }

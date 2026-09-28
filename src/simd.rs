@@ -258,6 +258,89 @@ pub unsafe fn gemv_q4_avx512(
 }
 
 // ============================================================
+// Causal Conv1d range — AVX2 (8-wide over output time)
+// ============================================================
+
+/// AVX2 causal Conv1d over output channels `[oc_start, oc_end)`.
+/// Bit-exact mirror of `causal_conv1d_range_scalar` (mul+add only, no FMA):
+/// bias fill, then per (oc, ic, k) `out[o] += in[o+off] * w` with the same
+/// (ic, k) accumulation order per output lane. Boundary taps that fall
+/// outside `[0, in_len)` stay scalar; the 8-aligned interior is vectorized.
+/// Weight/bias indexed by global `oc`, output rows by `oc - oc_start`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn causal_conv1d_range_avx2(
+    input: &[f32],
+    weight: &[f32], // [oc_total, in_ch, ksize] row-major
+    bias: &[f32],
+    in_ch: usize,
+    ksize: usize,
+    dilation: usize,
+    oc_start: usize,
+    oc_end: usize,
+    in_len: usize,
+    out_len: usize,
+    output: &mut [f32],
+) {
+    let causal_pad = (ksize - 1) * dilation;
+    let ick = in_ch * ksize;
+
+    for oc in oc_start..oc_end {
+        let local_oc = oc - oc_start;
+        let out_row = &mut output[local_oc * out_len..(local_oc + 1) * out_len];
+        // Bias fill (exact bits, same as scalar `sum = bias` init)
+        out_row.fill(bias[oc]);
+
+        let w_base = oc * ick;
+        for ic in 0..in_ch {
+            let in_base = ic * in_len;
+            let w_row = w_base + ic * ksize;
+            for k in 0..ksize {
+                let wk = weight[w_row + k];
+                let off = k as isize * dilation as isize - causal_pad as isize;
+                let lo = (0isize).max(-off);
+                let hi = (out_len as isize).min(in_len as isize - off);
+                if hi <= lo {
+                    continue;
+                }
+                let (lo, hi) = (lo as usize, hi as usize);
+                // Scalar head/tail around the 8-aligned interior
+                let vs = (lo + 7) / 8 * 8;
+                let ve = hi / 8 * 8;
+                for o in lo..vs.min(hi) {
+                    let idx = in_base + ((o as isize + off) as usize);
+                    out_row[o] += input[idx] * wk;
+                }
+                if ve > vs {
+                    // Vector block [o, o+8) reads input[o+off, o+off+8):
+                    // left edge from lo >= -off, right edge from ve <= hi <= in_len - off.
+                    debug_assert!(ve <= out_len);
+                    debug_assert!(vs as isize + off >= 0);
+                    debug_assert!(ve as isize + off <= in_len as isize);
+                    let wb = _mm256_set1_ps(wk);
+                    let mut o = vs;
+                    while o < ve {
+                        let acc = _mm256_loadu_ps(out_row.as_ptr().add(o));
+                        let x = _mm256_loadu_ps(
+                            input.as_ptr().add(in_base + ((o as isize + off) as usize)),
+                        );
+                        _mm256_storeu_ps(
+                            out_row.as_mut_ptr().add(o),
+                            _mm256_add_ps(acc, _mm256_mul_ps(x, wb)),
+                        );
+                        o += 8;
+                    }
+                }
+                for o in ve.max(vs)..hi {
+                    let idx = in_base + ((o as isize + off) as usize);
+                    out_row[o] += input[idx] * wk;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
 // F16 GEMV — AVX-512
 // ============================================================
 
