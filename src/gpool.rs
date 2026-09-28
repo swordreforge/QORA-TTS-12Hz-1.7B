@@ -17,13 +17,20 @@ struct Pool {
 fn global_pool() -> &'static Pool {
     static POOL: OnceLock<Pool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let workers = std::thread::available_parallelism()
+        let avail = std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(6)
             .max(1);
+        // QORA_THREADS overrides pool size (e.g. pin to P-cores).
+        let workers = std::env::var("QORA_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(avail);
+        let actual = workers.min(avail * 2).max(1);
         let (tx, rx) = mpsc::channel::<(Job, mpsc::Sender<Vec<f32>>)>();
         let rx = Arc::new(Mutex::new(rx));
-        for _ in 0..workers {
+        for _ in 0..actual {
             let rx = Arc::clone(&rx);
             std::thread::spawn(move || loop {
                 let (job, done) = match rx.lock().unwrap().recv() {
@@ -34,7 +41,7 @@ fn global_pool() -> &'static Pool {
                 let _ = done.send(out);
             });
         }
-        Pool { tx, workers }
+        Pool { tx, workers: actual }
     })
 }
 

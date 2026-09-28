@@ -234,9 +234,26 @@ threading threshold.
 | `RUSTFLAGS="-C target-cpu=native"` | 56.0s | 73.6s | -5% total |
 | native + persistent GEMV thread pool | 41.0s (1.21s/frame) | 58.1s | -25% total |
 | native + pool + hand-written AVX2 Q4 kernel | 25.9s (0.76s/frame) | 42.1s | -46% total |
-| + AVX2 causal-conv kernel (decode) | 25.7s | **32.7s (decode 13.8s → 4.2s)** | **-58% total** |
+| + AVX2 causal-conv kernel (decode) | 25.7s | 32.7s (decode 13.8s → 4.2s) | -58% total |
+| + GEMV overdecomposition (4x chunks) | **19.1s (0.56s/frame)** | **25.6s** | **-67% total** |
 
-All five produce bit-identical audio for the same seed (verified by sha256).
+Bit-identical chain: the first five builds produce identical audio for the same
+seed. Overdecomposition changed FP summation order, so bit-identity is no
+longer guaranteed in general — this run happened to be bit-identical
+(corr=1.0, max abs diff 0.0); treat tolerance + listening as the gate now.
+
+### Hybrid-CPU note (Intel Ultra 7 155H: 6P + 8E + 2LP-E)
+
+The pool splits work evenly, so join barriers wait for 2.5GHz LP-E cores while
+22 active cores also drag P-core clocks down. Pinning to P-cores only:
+
+```bash
+taskset -c 0-11 ./target/release/qora-tts --ref-audio ...  # gen 19.1s → 10.8s, total 25.6s → 18.3s
+```
+
+(`QORA_THREADS=N` overrides pool size portably, but only `taskset`/affinity
+keeps threads off E-cores. Note: decode convs scale with thread count, so
+P-only pinning speeds generation but slows decode 4.2s → 6.4s.)
 The pool (22 persistent workers, no per-call spawn) also lowered the threading
 threshold so predictor GEMVs parallelize. The AVX2 kernel (`simd::gemv_q4_avx2`,
 8-wide LUT via split `permutevar8x32`+blend) is runtime-dispatched below AVX-512;
@@ -251,36 +268,4 @@ differential tests assert bit-exact equality with the scalar oracle.
 | Voice cloning | Yes (ECAPA-TDNN) | No |
 | Built-in speakers | 25 (via voice files) | 9 (embedded) |
 | Code generation | ~2.5s/code | ~1.5s/code |
-| Quality | Higher | Good |
-| Best for | Quality + cloning | Speed + simplicity |
-
-## Building from Source
-
-```bash
-cargo build --release
-```
-
-### Dependencies
-
-- **Language**: Pure Rust (2021 edition)
-- `half` — F16 support
-- `tokenizers` — HuggingFace tokenizer
-- `safetensors` — Weight loading
-- `serde_json` — Config parsing
-- **No ML framework** for inference — all matrix ops are hand-written Rust
-
-### Cross-Platform Releases
-
-Pre-built binaries via GitHub Actions for Windows x86_64, Linux x86_64, macOS aarch64.
-
-## Model Binary Format (.qora-tts)
-
-Custom binary format for fast loading:
-
-```
-Header:  "QTTS" magic + version + format byte
-Talker:  28 transformer layers (Q4 quantized)
-Predictor: 5 transformer layers + code embeddings
-Decoder: VQ codebooks + 8 transformer layers + Vocos vocoder
-Speaker Encoder: ECAPA-TDNN (3 Res2Net blocks)
-```
+| Quality |

@@ -291,6 +291,11 @@ fn gemv_q4(input: &[f32], weight: &Q4Weight) -> Vec<f32> {
     // Thread budget proportional to work: ~500K MACs per worker keeps
     // dispatch overhead negligible while letting the predictor's ~1M-MAC
     // GEMVs (previously single-threaded under the 4M threshold) parallelize.
+    // Overdecomposition (4x chunks per worker): on hybrid CPUs, fast cores
+    // pull more chunks from the shared queue, eliminating barrier waits on
+    // slow E-cores. NOTE: chunk boundaries differ from the pre-overdecomp
+    // layout, so FP summation order (and output bits) changed vs older
+    // builds; results remain mathematically identical (see tolerance tests).
     let workers = crate::gpool::num_workers();
     let mut num_threads = (k * n / 500_000).clamp(1, workers);
     if k * n < 500_000 {
@@ -301,7 +306,10 @@ fn gemv_q4(input: &[f32], weight: &Q4Weight) -> Vec<f32> {
         return gemv_q4_inner(input, &weight.packed, &weight.scales, k, n, 0, k);
     }
 
-    let chunk_k = (k + num_threads - 1) / num_threads;
+    // 4 chunks per worker (capped so every chunk is non-empty); the pool's
+    // shared queue balances them across fast/slow cores automatically.
+    let num_chunks = (num_threads * 4).min(k).max(num_threads);
+    let chunk_k = (k + num_chunks - 1) / num_chunks;
     let input_ptr = input.as_ptr() as usize;
     let input_len = input.len();
     let packed_ptr = weight.packed.as_ptr() as usize;
@@ -309,7 +317,7 @@ fn gemv_q4(input: &[f32], weight: &Q4Weight) -> Vec<f32> {
     let scales_ptr = weight.scales.as_ptr() as usize;
     let scales_len = weight.scales.len();
 
-    let handles: Vec<_> = (0..num_threads)
+    let handles: Vec<_> = (0..num_chunks)
         .map(|t| {
             let k_start = t * chunk_k;
             let k_end = ((t + 1) * chunk_k).min(k);
@@ -793,6 +801,38 @@ mod tests {
         }
         assert_eq!(acc, acc_ref);
         // sanity: chunked ≈ full within float tolerance
+        for (a, b) in acc.iter().zip(full.iter()) {
+            assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_avx2_many_chunks_tolerance() {
+        // overdecomposition (e.g. 32 chunks): assembly stays close to single-pass
+        if !crate::simd::has_avx2() {
+            return;
+        }
+        let mut st = 77;
+        let (k, n) = (128, 1024);
+        let groups = n / Q4_GROUP_SIZE;
+        let packed = rbytes(&mut st, k * groups * (Q4_GROUP_SIZE / 2));
+        let scales = rscales(&mut st, k * groups, 0.1);
+        let input = rinput(&mut st, k, 0.1);
+        let full = gemv_q4_scalar(&input, &packed, &scales, n, 0, k);
+        let n_chunks = 32;
+        let ck = (k + n_chunks - 1) / n_chunks;
+        let mut acc = vec![0.0f32; n];
+        for t in 0..n_chunks {
+            let (a, b) = (t * ck, ((t + 1) * ck).min(k));
+            if a >= b {
+                continue;
+            }
+            let part = unsafe { crate::simd::gemv_q4_avx2(&input, &packed, &scales, n, a, b) };
+            for j in 0..n {
+                acc[j] += part[j];
+            }
+        }
         for (a, b) in acc.iter().zip(full.iter()) {
             assert!((a - b).abs() < 1e-3, "{a} vs {b}");
         }
