@@ -128,6 +128,7 @@ RVQ `num_quantizers=32`、`encoder_valid_num_quantizers=16`、`num_semantic_quan
 > 结论：通路正常、对齐机制存活（标点使逗号停顿 0.78→0.62s）；ICL 固定带 ~0.8~1s
 > 尾部静音 continuation（后处理可压）；韵律是否真正跟随需试听 + 更多样本。
 > 音频：`output_mum_xvec.wav` / `output_mum_icl.wav` / `output_mum_icl2.wav`（未进版本库）。
+> ✅ 试听确认（2026-09-28）：语调与参考本人说话的调子完美符合。ICL 目标达成。
 
 ## 7. 模型文件格式升级
 
