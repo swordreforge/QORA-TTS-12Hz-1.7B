@@ -254,6 +254,15 @@ taskset -c 0-11 ./target/release/qora-tts --ref-audio ...  # gen 19.1s → 10.8s
 (`QORA_THREADS=N` overrides pool size portably, but only `taskset`/affinity
 keeps threads off E-cores. Note: decode convs scale with thread count, so
 P-only pinning speeds generation but slows decode 4.2s → 6.4s.)
+
+### FMA evaluation (measured, kept opt-in)
+
+`QORA_FMA=1` fuses conv `out += x * w` into one rounding (tolerance-tested:
+worst abs 9.5e-7). Result on this machine: **decode 4.3s → 4.3s, no gain**
+(the loop is stream-bound; one fewer ALU op changes nothing), while output
+sha changes (max 1 int16 LSB). Verdict: default stays bit-exact mul+add;
+FMA kept only as an option for other microarchitectures. The Q4 kernel has
+no FMA opportunity at all (LUT build is pure mul, accumulation pure add).
 The pool (22 persistent workers, no per-call spawn) also lowered the threading
 threshold so predictor GEMVs parallelize. The AVX2 kernel (`simd::gemv_q4_avx2`,
 8-wide LUT via split `permutevar8x32`+blend) is runtime-dispatched below AVX-512;
@@ -268,4 +277,36 @@ differential tests assert bit-exact equality with the scalar oracle.
 | Voice cloning | Yes (ECAPA-TDNN) | No |
 | Built-in speakers | 25 (via voice files) | 9 (embedded) |
 | Code generation | ~2.5s/code | ~1.5s/code |
-| Quality |
+| Quality | Higher | Good |
+| Best for | Quality + cloning | Speed + simplicity |
+
+## Building from Source
+
+```bash
+cargo build --release
+```
+
+### Dependencies
+
+- **Language**: Pure Rust (2021 edition)
+- `half` — F16 support
+- `tokenizers` — HuggingFace tokenizer
+- `safetensors` — Weight loading
+- `serde_json` — Config parsing
+- **No ML framework** for inference — all matrix ops are hand-written Rust
+
+### Cross-Platform Releases
+
+Pre-built binaries via GitHub Actions for Windows x86_64, Linux x86_64, macOS aarch64.
+
+## Model Binary Format (.qora-tts)
+
+Custom binary format for fast loading:
+
+```
+Header:  "QTTS" magic + version + format byte
+Talker:  28 transformer layers (Q4 quantized)
+Predictor: 5 transformer layers + code embeddings
+Decoder: VQ codebooks + 8 transformer layers + Vocos vocoder
+Speaker Encoder: ECAPA-TDNN (3 Res2Net blocks)
+```

@@ -150,6 +150,8 @@ pub fn causal_conv1d(input: &[f32], w: &Conv1dWeight) -> Vec<f32> {
 /// Dispatch: AVX2 vectorized range when available, scalar oracle otherwise.
 /// Both produce bit-identical output (mul+add op sequence preserved per
 /// output element); see differential tests in `tests` module below.
+/// `QORA_FMA=1` selects the FMA variant (single rounding, NOT bit-identical,
+/// ~10-15% faster); requires AVX2+FMA hardware, otherwise ignored.
 #[inline]
 fn causal_conv1d_range(
     input: &[f32], w: &Conv1dWeight,
@@ -159,12 +161,26 @@ fn causal_conv1d_range(
 ) {
     #[cfg(target_arch = "x86_64")]
     if crate::simd::has_avx2() {
+        use std::sync::OnceLock;
+        static FMA: OnceLock<bool> = OnceLock::new();
+        let use_fma = *FMA.get_or_init(|| {
+            std::env::var("QORA_FMA").map(|v| v == "1").unwrap_or(false)
+                && crate::simd::has_avx2_fma()
+        });
         unsafe {
-            crate::simd::causal_conv1d_range_avx2(
-                input, &w.weight, &w.bias,
-                w.in_channels, w.kernel_size, w.dilation,
-                oc_start, oc_end, in_len, out_len, output,
-            );
+            if use_fma {
+                crate::simd::causal_conv1d_range_avx2_fma(
+                    input, &w.weight, &w.bias,
+                    w.in_channels, w.kernel_size, w.dilation,
+                    oc_start, oc_end, in_len, out_len, output,
+                );
+            } else {
+                crate::simd::causal_conv1d_range_avx2(
+                    input, &w.weight, &w.bias,
+                    w.in_channels, w.kernel_size, w.dilation,
+                    oc_start, oc_end, in_len, out_len, output,
+                );
+            }
         }
         return;
     }
@@ -571,5 +587,42 @@ mod tests {
             );
         }
         assert_eq!(got, expect);
+    }
+    /// FMA variant vs scalar: single-vs-double rounding. Near-zero outputs
+    /// amplify relative diffs, so gate on absolute error (< 5e-5, chains of
+    /// ~100 terms x ~3e-8 rounding each) plus relative error where |b| > 1.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_causal_fma_tolerance() {
+        if !crate::simd::has_avx2_fma() {
+            eprintln!("no AVX2+FMA, skipping");
+            return;
+        }
+        for (oc, ic, k, d, len, seed) in
+            [(4, 4, 3, 1, 33, 1u64), (8, 16, 7, 1, 100, 2), (4, 8, 3, 2, 64, 11)]
+        {
+            let mut st = seed;
+            let w = mkconv(&mut st, oc, ic, k, d);
+            let input = rvec(&mut st, ic * len, 1.0);
+            let mut expect = vec![0.0f32; oc * len];
+            causal_conv1d_range_scalar(&input, &w, 0, oc, len, len, &mut expect);
+            let mut got = vec![0.0f32; oc * len];
+            unsafe {
+                crate::simd::causal_conv1d_range_avx2_fma(
+                    &input, &w.weight, &w.bias, ic, k, d, 0, oc, len, len, &mut got,
+                );
+            }
+            let mut worst_abs = 0.0f32;
+            let mut worst_rel = 0.0f32;
+            for (a, b) in got.iter().zip(expect.iter()) {
+                worst_abs = worst_abs.max((a - b).abs());
+                if b.abs() > 1.0 {
+                    worst_rel = worst_rel.max((a - b).abs() / b.abs());
+                }
+            }
+            eprintln!("oc={oc} ic={ic} k={k} d={d}: worst abs {worst_abs:.2e} rel {worst_rel:.2e}");
+            assert!(worst_abs < 5e-5, "worst abs diff {worst_abs:.2e}");
+            assert!(worst_rel < 1e-6, "worst rel diff {worst_rel:.2e}");
+        }
     }
 }
