@@ -118,6 +118,17 @@ RVQ `num_quantizers=32`、`encoder_valid_num_quantizers=16`、`num_semantic_quan
 - 性能：encoder 为一次性开销（参考 45MB speaker encoder 秒级完成），记录 Total 变化；
   生成阶段单帧耗时不应变化。
 
+> ✅ 首轮 A/B（2026-09-28，mum3bv 11.28s 真人单人声库，seed 777，文本"今天天气真好，我们出去走走吧"）：
+> 参考本身：快节奏句内（间隙 0.04~0.1s）+ 3 个长句间停顿（0.66/1.36/0.68s）。
+> | 版本 | 总长 | speech | silence | 逗号停顿 | 尾部静音 |
+> |---|---|---|---|---|---|
+> | xvec | 3.04s | 1.82s | 1.22s | 0.74s | 0.10s |
+> | ICL（转写无标点） | 3.76s | 1.58s | 2.18s | 0.78s | 0.96s |
+> | ICL（转写加标点） | 3.36s | 1.62s | 1.74s | 0.62s | 0.82s |
+> 结论：通路正常、对齐机制存活（标点使逗号停顿 0.78→0.62s）；ICL 固定带 ~0.8~1s
+> 尾部静音 continuation（后处理可压）；韵律是否真正跟随需试听 + 更多样本。
+> 音频：`output_mum_xvec.wav` / `output_mum_icl.wav` / `output_mum_icl2.wav`（未进版本库）。
+
 ## 7. 模型文件格式升级
 
 - `model.qora-tts`：`VERSION + 1`（见 `src/save.rs`），尾部 append encoder 段。
