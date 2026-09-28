@@ -14,6 +14,10 @@ test_q4_load.*
 model/0.6B/model.qora-tts
 model/1.7B/model.qora-tts
 model/speech_tokenizer-model.safetensors
+# user artifacts: voice profiles + debug code dumps (derivable, per-run)
+*.qvoice
+*.codes
+*.vcod
 COMPRESSION_GUIDE.md
 IMPLEMENTATION_COMPLETE.md
 README_VOICE_CLONING.md
