@@ -77,6 +77,93 @@ fn build_tts_pad_bos(talker: &TalkerWeights, pad_count: usize) -> Vec<Vec<f32>> 
     result
 }
 
+/// Streaming-branch ICL block layout (official `generate_icl_prompt`).
+/// text_len = R + T + 1 (ref tokens + text tokens + eos);
+/// codec_len = Tv + 1 (codec_bos + ref frames).
+/// text_len > codec_len: icl takes the first codec_len pairs, rest is remainder.
+/// else: text side padded with tts_pad to codec_len, remainder empty.
+pub struct IclLayout {
+    pub icl_len: usize,
+    pub remainder_len: usize,
+}
+
+pub fn icl_block_layout(ref_t: usize, text_t: usize, tv: usize) -> IclLayout {
+    let text_len = ref_t + text_t + 1;
+    let codec_len = tv + 1;
+    if text_len > codec_len {
+        IclLayout { icl_len: codec_len, remainder_len: text_len - codec_len }
+    } else {
+        IclLayout { icl_len: codec_len, remainder_len: 0 }
+    }
+}
+
+fn add_embed(a: &[f32], b: &[f32]) -> Vec<f32> {
+    a.iter().zip(b.iter()).map(|(x, y)| x + y).collect()
+}
+
+/// Build the ICL block: (icl_embeds, remainder).
+/// text side = text_proj(ref_tokens + text_tokens) + tts_eos;
+/// codec side = codec_bos + per-frame sums over all 16 code groups
+/// (group 0 via talker codec table, groups 1-15 via predictor tables).
+/// Combined with the streaming branch rule (see `icl_block_layout`).
+/// `ref_codes` is [16][Tv] from the codec encoder; values must be < 2048.
+pub fn build_icl_block(
+    talker: &TalkerWeights,
+    predictor: &CodePredictorWeights,
+    ref_tokens: &[u32],
+    text_tokens: &[u32],
+    ref_codes: &[Vec<u32>],
+) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    assert_eq!(ref_codes.len(), 16, "ref_codes must have 16 codebooks");
+    let tv = ref_codes[0].len();
+    assert!(tv > 0, "ref_codes must be non-empty");
+    assert!(ref_codes.iter().all(|c| c.len() == tv), "ragged ref_codes");
+
+    let tts_pad = crate::talker::embed_text_token(talker, TTS_PAD);
+    let tts_eos = crate::talker::embed_text_token(talker, TTS_EOS);
+
+    let mut text_full = Vec::with_capacity(ref_tokens.len() + text_tokens.len() + 1);
+    for &tok in ref_tokens.iter().chain(text_tokens.iter()) {
+        text_full.push(crate::talker::embed_text_token(talker, tok));
+    }
+    text_full.push(tts_eos);
+
+    let mut codec_full = Vec::with_capacity(tv + 1);
+    codec_full.push(crate::talker::embed_codec_token(talker, CODEC_BOS));
+    for t in 0..tv {
+        let mut sum = crate::talker::embed_codec_token(talker, ref_codes[0][t]);
+        for g in 1..16 {
+            let e = crate::code_predictor::get_acoustic_embedding(predictor, g - 1, ref_codes[g][t]);
+            for j in 0..talker.hidden_size {
+                sum[j] += e[j];
+            }
+        }
+        codec_full.push(sum);
+    }
+
+    let layout = icl_block_layout(ref_tokens.len(), text_tokens.len(), tv);
+    let (icl, remainder) = if text_full.len() > codec_full.len() {
+        let mut icl = Vec::with_capacity(codec_full.len());
+        for (a, b) in text_full.iter().take(codec_full.len()).zip(codec_full.iter()) {
+            icl.push(add_embed(a, b));
+        }
+        (icl, text_full[codec_full.len()..].to_vec())
+    } else {
+        let mut icl = Vec::with_capacity(codec_full.len());
+        for (i, b) in codec_full.iter().enumerate() {
+            if i < text_full.len() {
+                icl.push(add_embed(&text_full[i], b));
+            } else {
+                icl.push(add_embed(&tts_pad, b));
+            }
+        }
+        (icl, Vec::new())
+    };
+    debug_assert_eq!(icl.len(), layout.icl_len);
+    debug_assert_eq!(remainder.len(), layout.remainder_len);
+    (icl, remainder)
+}
+
 /// Prefill for CustomVoice matching qwen3-tts-rs structure
 /// Returns (last_hidden_state, logits) where:
 /// - last_hidden_state: [hidden_size] - the hidden state from the last position
@@ -88,6 +175,7 @@ fn prefill_custom_voice(
     language_id: u32,
     voice_embedding: Option<&[f32]>,
     kv_cache: &mut gemv::RawKvCache,
+    icl_embeds: Option<&[Vec<f32>]>,
 ) -> (Vec<f32>, Vec<f32>) {
     let hidden_size = talker.hidden_size;
 
@@ -137,8 +225,13 @@ fn prefill_custom_voice(
         }
         all_embeds.push(pad_combined);
 
-        // Position 6: BOS + first_text (if text exists)
-        if !text_tokens.is_empty() {
+        // ICL mode (official streaming branch): base is role + 6 codec positions,
+        // then the ICL block; the BOS+first_text position is NOT appended.
+        // Non-ICL: unchanged legacy path below.
+        if let Some(icl) = icl_embeds {
+            all_embeds.extend(icl.iter().cloned());
+        } else if !text_tokens.is_empty() {
+            // Position 6: BOS + first_text (if text exists)
             let bos_emb = crate::talker::embed_codec_token(talker, CODEC_BOS);
             let first_text_proj = crate::talker::embed_text_token(talker, text_tokens[0]);
             let mut combined = vec![0.0f32; hidden_size];
@@ -205,6 +298,8 @@ pub fn generate_speech(
     voice_embedding: Option<&[f32]>,
     params: &TTSParams,
     seed: Option<u64>,
+    ref_text_tokens: Option<Vec<u32>>,
+    ref_codes: Option<&[Vec<u32>]>,
 ) -> Vec<f32> {
     let t0 = Instant::now();
 
@@ -212,17 +307,39 @@ pub fn generate_speech(
     let text_tokens = tokenizer.encode(text);
     eprintln!("Tokenized {} tokens", text_tokens.len());
 
+    // ICL mode: build the ICL block (official streaming branch) from reference
+    // text tokens + reference codes. In ICL mode the per-step fusion is the
+    // block remainder only (no legacy trailing-text fusion).
+    let icl: Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> = match (&ref_text_tokens, &ref_codes) {
+        (Some(rt), Some(rc)) => {
+            let (block, remainder) = build_icl_block(talker, predictor, rt, &text_tokens, rc);
+            eprintln!("ICL mode: ref_text {} tokens, ref_codes 16x{}, block {}, remainder {}",
+                rt.len(), rc[0].len(), block.len(), remainder.len());
+            Some((block, remainder))
+        }
+        _ => None,
+    };
+
     // Initialize KV cache
     let mut talker_kv = gemv::empty_kv_cache(talker.num_layers(), talker.num_kv_heads, talker.head_dim);
 
     // Prefill with proper dual-stream architecture
     let t_prefill = Instant::now();
-    let (mut last_hidden, mut logits) = prefill_custom_voice(talker, &text_tokens, speaker_id, language_id, voice_embedding, &mut talker_kv);
-    let mut position = if text_tokens.is_empty() { 9 } else { 10 };  // 3 role + 6 codec + 1 first_text
+    let (mut last_hidden, mut logits) = prefill_custom_voice(talker, &text_tokens, speaker_id, language_id, voice_embedding, &mut talker_kv, icl.as_ref().map(|(b, _)| b.as_slice()));
+    let mut position = match &icl {
+        // 3 role + 6 codec + ICL block (no first_text position, official streaming ICL)
+        Some((block, _)) => 9 + block.len(),
+        // legacy: 3 role + 6 codec + 1 first_text
+        None => if text_tokens.is_empty() { 9 } else { 10 },
+    };
     eprintln!("Prefill done in {:.1?}, position={}", t_prefill.elapsed(), position);
 
-    // Build trailing text embeddings (remaining text tokens after first + TTS_EOS)
-    let trailing_text = build_trailing_text(talker, &text_tokens);
+    // Build trailing text embeddings (remaining text tokens after first + TTS_EOS).
+    // ICL mode overrides this with the block remainder (may be empty → always pad).
+    let trailing_text: Vec<Vec<f32>> = match &icl {
+        Some((_, remainder)) => remainder.clone(),
+        None => build_trailing_text(talker, &text_tokens),
+    };
     let trailing_text_len = trailing_text.len();
     let tts_pad_embed = crate::talker::embed_text_token(talker, TTS_PAD);
 
@@ -401,4 +518,43 @@ fn sample_token(logits: &[f32], params: &TTSParams, prev_tokens: &[u32], rng: &m
     }
 
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_icl_layout_text_longer() {
+        // R=8 ref tokens, T=8 text tokens, Tv=23 frames:
+        // text_len=17 > codec_len=24? No: 8+8+1=17 < 24 → else branch.
+        let l = icl_block_layout(8, 8, 23);
+        assert_eq!(l.icl_len, 24);
+        assert_eq!(l.remainder_len, 0);
+    }
+
+    #[test]
+    fn test_icl_layout_remainder() {
+        // R=30, T=30, Tv=23: text_len=61 > codec_len=24 → remainder 37.
+        let l = icl_block_layout(30, 30, 23);
+        assert_eq!(l.icl_len, 24);
+        assert_eq!(l.remainder_len, 37);
+    }
+
+    #[test]
+    fn test_icl_layout_equal() {
+        // text_len == codec_len → else branch, no remainder.
+        // R=11, T=11, Tv=22: 11+11+1=23 == 22+1.
+        let l = icl_block_layout(11, 11, 22);
+        assert_eq!(l.icl_len, 23);
+        assert_eq!(l.remainder_len, 0);
+    }
+
+    #[test]
+    fn test_icl_layout_short_ref() {
+        // R=1, T=1, Tv=23: text_len=3 < 24 → pad branch.
+        let l = icl_block_layout(1, 1, 23);
+        assert_eq!(l.icl_len, 24);
+        assert_eq!(l.remainder_len, 0);
+    }
 }

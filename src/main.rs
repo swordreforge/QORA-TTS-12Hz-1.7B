@@ -21,6 +21,8 @@ fn main() {
     let mut voice_codes_path: Option<PathBuf> = None;
     let mut decode_codes_path: Option<PathBuf> = None;
     let mut ref_audio_path: Option<PathBuf> = None;
+    let mut ref_text: Option<String> = None;
+    let mut encoder_weights_path: Option<PathBuf> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -94,6 +96,18 @@ fn main() {
             "--ref-audio" => {
                 if i + 1 < args.len() {
                     ref_audio_path = Some(PathBuf::from(&args[i + 1]));
+                    i += 1;
+                }
+            }
+            "--ref-text" => {
+                if i + 1 < args.len() {
+                    ref_text = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "--encoder-weights" => {
+                if i + 1 < args.len() {
+                    encoder_weights_path = Some(PathBuf::from(&args[i + 1]));
                     i += 1;
                 }
             }
@@ -222,6 +236,12 @@ fn main() {
         None
     };
 
+    // ICL mode requires both reference audio and reference transcript
+    if ref_text.is_some() && ref_audio_path.is_none() {
+        eprintln!("--ref-text requires --ref-audio (ICL needs reference codes from audio)");
+        std::process::exit(1);
+    }
+
     // Load voice codes if --voice-codes provided
     let voice_codes = if let Some(ref vcp) = voice_codes_path {
         eprintln!("Loading voice codes from {}...", vcp.display());
@@ -229,6 +249,37 @@ fn main() {
     } else {
         None
     };
+
+    // ICL mode: encode reference audio to codes + tokenize reference text.
+    // ref_tokens == official ref_ids[:, 3:-2] (template stripped on both ends).
+    let (ref_text_tokens, ref_codes): (Option<Vec<u32>>, Option<Vec<Vec<u32>>>) =
+        match (&ref_text, &ref_audio_path) {
+            (Some(rt), Some(_)) => {
+                let enc_path = encoder_weights_path.clone().unwrap_or_else(|| {
+                    base_path.join("speech_tokenizer").join("model.safetensors")
+                });
+                eprintln!("ICL mode: loading codec encoder from {}...", enc_path.display());
+                let enc = qora_tts::codec_encoder::load_codec_encoder(&enc_path)
+                    .unwrap_or_else(|e| {
+                        eprintln!("Failed to load codec encoder: {e}");
+                        eprintln!("hint: pass --encoder-weights <speech_tokenizer/model.safetensors>");
+                        std::process::exit(1);
+                    });
+                // Reuse the already-loaded reference audio (also used for the embedding)
+                let (audio_icl, _) = qora_tts::wav::read_wav(
+                    ref_audio_path.as_ref().unwrap(),
+                )
+                .expect("Failed to reload reference audio");
+                let t_enc = Instant::now();
+                let codes = qora_tts::codec_encoder::encode_waveform_to_codes(&enc, &audio_icl);
+                eprintln!("Reference encoded to 16x{} codes in {:.1?}",
+                    codes[0].len(), t_enc.elapsed());
+                let toks = tokenizer.encode(rt);
+                eprintln!("Reference text: {} tokens", toks.len());
+                (Some(toks), Some(codes))
+            }
+            _ => (None, None),
+        };
 
     // === CPU inference ===
     let audio = qora_tts::generate_new::generate_speech(
@@ -245,6 +296,8 @@ fn main() {
             codec_bos_id: 2149,
         },
         seed,
+        ref_text_tokens,
+        ref_codes.as_deref(),
     );
 
     // Save WAV

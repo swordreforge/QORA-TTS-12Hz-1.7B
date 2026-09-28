@@ -45,6 +45,13 @@ RVQ `num_quantizers=32`、`encoder_valid_num_quantizers=16`、`num_semantic_quan
   黄金往返 corr=0.9676。途中修掉 `mimi_conv_forward` 通道数参数脚枪
   （改用 `conv.in_ch`，见 commit）。
 - **Phase B**：移植 `generate_icl_prompt` → `--ref-text` 接线 + 双开关 → 无 ref-text 时行为零变化。
+  ✅ 已完成（2026-09-28）：`--ref-text` / `--encoder-weights`（默认
+  `<model>/speech_tokenizer/model.safetensors`）；`build_icl_block` 按官方
+  streaming 分支（text+pad 与 codec 对齐、余数进 trailing）；ICL 时 prefill 为
+  9+block（无 first_text 位），逐帧只融 remainder/pad。
+  B3 回归：同 seed 无 ref-text 双跑 sha256 一致。ICL 首测通路正常
+  （ref 6 tokens/35 帧 → block 36/remainder 0 → 27 帧出声），但出现 0.8s 句首
+  停顿（疑似 continuation 效应），韵律质量待 Phase C 用真人参考 + 试听评估。
 - **Phase C**：同 seed A/B 评测 + 回归 + 性能记录。
 
 ## 4. Phase A 细化

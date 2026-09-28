@@ -274,6 +274,13 @@ pub fn generate_acoustic_codes(
 
 /// Get embedding for an acoustic code token.
 /// acoustic_embeddings shape: [codebook_size, hidden_size]
+/// Get embedding for a single acoustic code from one codebook group.
+/// Used by ICL prompt construction (per-frame sum over 16 groups).
+pub fn get_acoustic_embedding(weights: &CodePredictorWeights, group_idx: usize, code: u32) -> Vec<f32> {
+    let embed_dim = weights.codec_embeddings[0].n();
+    embed_lookup(&weights.codec_embeddings[group_idx], code as usize, embed_dim)
+}
+
 /// Get sum of embeddings for all 15 acoustic codes.
 /// Sums embeddings from all 15 codebooks for the given acoustic codes.
 /// Sums embeddings from all 15 codebooks for the given acoustic codes.
