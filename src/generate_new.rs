@@ -96,14 +96,14 @@ fn prefill_custom_voice(
 
     // 2. Build codec + text overlay sequence
     // Structure depends on whether voice embedding is provided:
-    //   With voice: [THINK+PAD, THINK_BOS+PAD, lang+PAD, THINK_EOS+PAD, voice_raw, PAD+TTS_BOS, BOS+first_text]
+    //   With voice: [THINK+PAD, THINK_BOS+PAD, lang+PAD, THINK_EOS+PAD, voice+PAD, PAD+TTS_BOS, BOS+first_text]
     //   Without:    [THINK+PAD, THINK_BOS+PAD, lang+PAD, THINK_EOS+PAD, spk+PAD, PAD+TTS_BOS, BOS+first_text]
 
     let mut all_embeds = Vec::new();
     all_embeds.extend(role_prefix);           // 3 positions (text-only)
 
     if voice_embedding.is_some() {
-        // Voice cloning path: 4 codec+TTS_PAD, 1 raw voice embed, PAD+TTS_BOS, BOS+first_text
+        // Voice cloning path: 4 codec+TTS_PAD, 1 voice+TTS_PAD, PAD+TTS_BOS, BOS+first_text
         let prefix_codec = [CODEC_THINK, CODEC_THINK_BOS, language_id, CODEC_THINK_EOS];
         let tts_pad_proj = crate::talker::embed_text_token(talker, TTS_PAD);
         let tts_bos_proj = crate::talker::embed_text_token(talker, TTS_BOS);
@@ -118,11 +118,16 @@ fn prefill_custom_voice(
             all_embeds.push(combined);
         }
 
-        // Position 4: raw voice embedding (NO codec base, NO text overlay)
+        // Position 4: voice embedding + TTS_PAD overlay (matches official:
+        // _talker_input_embed = cat(tts_pad x5, tts_bos) + codec[:, :-1])
         let emb = voice_embedding.unwrap();
         let voice_norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
-        eprintln!("  Voice embedding norm={:.4}, injected raw at position 4", voice_norm);
-        all_embeds.push(emb.to_vec());
+        eprintln!("  Voice embedding norm={:.4}, injected with TTS_PAD overlay at position 4", voice_norm);
+        let mut pos4 = vec![0.0f32; hidden_size];
+        for j in 0..hidden_size.min(emb.len()) {
+            pos4[j] = emb[j] + tts_pad_proj[j];
+        }
+        all_embeds.push(pos4);
 
         // Position 5: PAD + TTS_BOS overlay
         let pad_emb = crate::talker::embed_codec_token(talker, CODEC_PAD);

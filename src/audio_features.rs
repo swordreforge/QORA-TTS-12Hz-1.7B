@@ -324,14 +324,33 @@ fn create_mel_filterbank(
     filterbank
 }
 
-/// Convert Hz to mel scale (HTK formula)
+/// Convert Hz to mel scale (Slaney / Auditory Toolbox formula, matching librosa htk=False)
+/// This is what the official Qwen3-TTS mel_spectrogram() uses via librosa.filters.mel.
 fn hz_to_mel(hz: f32) -> f32 {
-    2595.0 * (1.0 + hz / 700.0).log10()
+    let f_min = 0.0f32;
+    let f_sp = 200.0f32 / 3.0f32;
+    let min_log_hz = 1000.0f32;
+    let min_log_mel = (min_log_hz - f_min) / f_sp;
+    let logstep = 6.4f32.ln() / 27.0f32;
+    if hz >= min_log_hz {
+        min_log_mel + (hz / min_log_hz).ln() / logstep
+    } else {
+        (hz - f_min) / f_sp
+    }
 }
 
-/// Convert mel to Hz scale
+/// Convert mel to Hz scale (Slaney, matching librosa htk=False)
 fn mel_to_hz(mel: f32) -> f32 {
-    700.0 * (10.0f32.powf(mel / 2595.0) - 1.0)
+    let f_min = 0.0f32;
+    let f_sp = 200.0f32 / 3.0f32;
+    let min_log_hz = 1000.0f32;
+    let min_log_mel = (min_log_hz - f_min) / f_sp;
+    let logstep = 6.4f32.ln() / 27.0f32;
+    if mel >= min_log_mel {
+        min_log_hz * (logstep * (mel - min_log_mel)).exp()
+    } else {
+        f_min + f_sp * mel
+    }
 }
 
 #[cfg(test)]
@@ -340,8 +359,13 @@ mod tests {
 
     #[test]
     fn test_mel_conversion() {
-        assert!((hz_to_mel(1000.0) - 1000.0).abs() < 1.0);
-        assert!((mel_to_hz(hz_to_mel(1000.0)) - 1000.0).abs() < 1.0);
+        // Slaney scale: 1000 Hz <-> 15.0 mel (linear region boundary)
+        assert!((hz_to_mel(1000.0) - 15.0).abs() < 1e-3);
+        assert!((mel_to_hz(15.0) - 1000.0).abs() < 1.0);
+        // Roundtrip across the log region
+        for &hz in &[500.0f32, 4000.0, 8000.0, 12000.0] {
+            assert!((mel_to_hz(hz_to_mel(hz)) - hz).abs() < hz * 1e-4 + 1e-2);
+        }
     }
 
     #[test]
