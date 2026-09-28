@@ -186,6 +186,34 @@ Tested on i5-11500 (6C/12T), 16GB RAM, CPU-only:
 
 **Example:** "Hello, how are you?" (~3 seconds of audio) takes ~15-20 seconds total.
 
+## Benchmark (Intel Core Ultra 7 155H, 22 threads, 32GB RAM, CPU-only)
+
+Measured with `--seed` fixed (reproducible). Time scales with **frames**, not text
+length — sampling variance changes EOS timing run to run.
+
+| Text | Frames | Audio | Total | Notes |
+|------|--------|-------|-------|-------|
+| 你好 (chinese) | 8 | 0.6s | 20.5s | x-vector |
+| 你好初次见面我是Nori (chinese) | 35 | 2.8s | ~78s | x-vector, no commas |
+| 你好,初次见面,我是Nori (chinese) | 45 | 3.6s | 95.5s | x-vector, commas add pauses |
+| 今天天气真好 (chinese) | 27 | 2.2s | ~82s | ICL (ref 35 frames) |
+| Good morning, how are you today? I hope you are well. (english) | 47 | 3.8s | 104.3s | x-vector |
+| same (english) | 33 | 2.6s | 104.4s | ICL (ref 114 frames): fewer frames, tighter pauses |
+
+Per-phase rates on this machine:
+
+| Phase | Rate |
+|-------|------|
+| Model load | ~1.0s (1511 MB) |
+| Voice extraction | ~1-2s (scales with ref length) |
+| Prefill | ~3s, ~12s with ICL block (142 positions) |
+| Generation | **~1.8s/frame** (talker, single-threaded) |
+| Decode | **~0.4s/frame** (VQ + Vocos) |
+| ICL encode (one-time) | ~8s (codec encoder from sidecar weights) |
+
+Rule of thumb: `Total ≈ 5s + frames × 2.2s (+ 8s ICL)`, with 1 frame = 80ms audio.
+Cap runaway runs with `--max-codes` (e.g. 100 ≈ 8s audio max).
+
 ## Comparison with 0.6B
 
 | | QORA-TTS 1.7B | QORA-TTS 0.6B |
