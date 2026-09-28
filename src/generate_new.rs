@@ -235,12 +235,20 @@ pub fn generate_speech(
     let mut all_codes: Vec<Vec<u32>> = vec![Vec::new(); 16];
     let mut prev_tokens = vec![0u32; 16];  // For repetition penalty
 
-    let mut rng_state: u64 = seed.unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64
-    });
+    let mut rng_state: u64 = match seed {
+        Some(s) => {
+            eprintln!("Seed: {s} (explicit)");
+            s
+        }
+        None => {
+            let s = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            eprintln!("Seed: {s} (random, reuse with --seed {s})");
+            s
+        }
+    };
 
     let t_gen = Instant::now();
 
