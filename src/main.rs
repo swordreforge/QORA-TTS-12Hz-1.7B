@@ -23,6 +23,7 @@ fn main() {
     let mut ref_audio_path: Option<PathBuf> = None;
     let mut ref_text: Option<String> = None;
     let mut encoder_weights_path: Option<PathBuf> = None;
+    let mut trim_silence: f32 = 0.0;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -108,6 +109,12 @@ fn main() {
             "--encoder-weights" => {
                 if i + 1 < args.len() {
                     encoder_weights_path = Some(PathBuf::from(&args[i + 1]));
+                    i += 1;
+                }
+            }
+            "--trim-silence" => {
+                if i + 1 < args.len() {
+                    trim_silence = args[i + 1].parse().unwrap_or(0.0);
                     i += 1;
                 }
             }
@@ -201,8 +208,25 @@ fn main() {
     eprintln!("Temperature: {temperature}, Top-K: {top_k}, Seed: {}",
         seed.map(|s| s.to_string()).unwrap_or("random".into()));
 
+    // Load reference audio once (auto-resampled to 24kHz mono) for both
+    // the speaker embedding and, in ICL mode, the codec encoder.
+    let ref_audio_24k: Option<Vec<f32>> = if let Some(ref ref_path) = ref_audio_path {
+        eprintln!("Loading reference audio {}...", ref_path.display());
+        let (audio, converted) = qora_tts::wav::read_wav_mono_24k(ref_path)
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to load reference audio: {e}");
+                std::process::exit(1);
+            });
+        if converted {
+            eprintln!("Reference resampled to 24kHz mono ({} samples)", audio.len());
+        }
+        Some(audio)
+    } else {
+        None
+    };
+
     // Load speaker encoder and extract voice embedding if --ref-audio provided
-    let voice_embedding: Option<Vec<f32>> = if let Some(ref ref_path) = ref_audio_path {
+    let voice_embedding: Option<Vec<f32>> = if let Some(ref audio) = ref_audio_24k {
         eprintln!("Loading speaker encoder for voice cloning...");
         let t0 = Instant::now();
         let speaker_encoder = speaker_encoder_opt
@@ -210,18 +234,10 @@ fn main() {
         let enc_mb = speaker_encoder.memory_bytes() / (1024 * 1024);
         eprintln!("Speaker encoder: {enc_mb} MB, loaded in {:.1?}", t0.elapsed());
 
-        // Load and process reference audio
-        eprintln!("Extracting voice from {}...", ref_path.display());
-        let (audio, sr) = qora_tts::wav::read_wav(ref_path)
-            .expect("Failed to load reference audio");
-
-        if sr != 24000 {
-            eprintln!("Warning: Reference audio is {sr}Hz, expected 24kHz. Results may be degraded.");
-        }
-
         // Extract mel-spectrogram (speaker encoder uses different params than codec)
+        eprintln!("Extracting voice embedding...");
         let mel_config = qora_tts::audio_features::MelConfig::speaker_encoder();
-        let mel_spec = qora_tts::audio_features::extract_mel_spectrogram(&audio, &mel_config);
+        let mel_spec = qora_tts::audio_features::extract_mel_spectrogram(audio, &mel_config);
 
         // Extract speaker embedding
         let embedding = qora_tts::speaker_encoder::extract_speaker_embedding(
@@ -253,8 +269,8 @@ fn main() {
     // ICL mode: encode reference audio to codes + tokenize reference text.
     // ref_tokens == official ref_ids[:, 3:-2] (template stripped on both ends).
     let (ref_text_tokens, ref_codes): (Option<Vec<u32>>, Option<Vec<Vec<u32>>>) =
-        match (&ref_text, &ref_audio_path) {
-            (Some(rt), Some(_)) => {
+        match (&ref_text, &ref_audio_24k) {
+            (Some(rt), Some(audio_icl)) => {
                 let enc_path = encoder_weights_path.clone().unwrap_or_else(|| {
                     base_path.join("speech_tokenizer").join("model.safetensors")
                 });
@@ -265,11 +281,7 @@ fn main() {
                         eprintln!("hint: pass --encoder-weights <speech_tokenizer/model.safetensors>");
                         std::process::exit(1);
                     });
-                // Reuse the already-loaded reference audio (also used for the embedding)
-                let (audio_icl, _) = qora_tts::wav::read_wav(
-                    ref_audio_path.as_ref().unwrap(),
-                )
-                .expect("Failed to reload reference audio");
+                // Reference audio already loaded + resampled above
                 let t_enc = Instant::now();
                 let codes = qora_tts::codec_encoder::encode_waveform_to_codes(&enc, &audio_icl);
                 eprintln!("Reference encoded to 16x{} codes in {:.1?}",
@@ -299,6 +311,17 @@ fn main() {
         ref_text_tokens,
         ref_codes.as_deref(),
     );
+
+    // Optional silence compression (internal gaps + trailing tail)
+    let audio = if trim_silence > 0.0 {
+        let before = audio.len();
+        let trimmed = qora_tts::wav::trim_silence(&audio, 24000, trim_silence);
+        eprintln!("Trim silence (>{trim_silence}s): {} -> {} samples ({:.2}s -> {:.2}s)",
+            before, trimmed.len(), before as f32 / 24000.0, trimmed.len() as f32 / 24000.0);
+        trimmed
+    } else {
+        audio
+    };
 
     // Save WAV
     qora_tts::wav::write_wav(&output_path, &audio, 24000)

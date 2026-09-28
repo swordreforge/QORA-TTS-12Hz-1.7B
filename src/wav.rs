@@ -130,3 +130,191 @@ pub fn read_wav(path: &Path) -> io::Result<(Vec<f32>, u32)> {
 
     Err(io::Error::new(io::ErrorKind::InvalidData, "Missing data chunk"))
 }
+
+/// Linear-interpolation resample of mono audio to a new sample rate.
+/// Duration-preserving: out_len = round(in_len * to_sr / from_sr).
+pub fn resample_mono(input: &[f32], from_sr: u32, to_sr: u32) -> Vec<f32> {
+    if input.is_empty() || from_sr == 0 || to_sr == 0 {
+        return input.to_vec();
+    }
+    if from_sr == to_sr {
+        return input.to_vec();
+    }
+    let ratio = to_sr as f64 / from_sr as f64;
+    let out_len = ((input.len() as f64) * ratio).round() as usize;
+    if out_len == 0 {
+        return Vec::new();
+    }
+    let last = input.len() - 1;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let pos = i as f64 / ratio;
+        let i0 = (pos.floor() as usize).min(last);
+        let i1 = (i0 + 1).min(last);
+        let frac = (pos - i0 as f64) as f32;
+        out.push(input[i0] + (input[i1] - input[i0]) * frac);
+    }
+    out
+}
+
+/// Read any mono/stereo 16-bit WAV and return mono f32 at 24000 Hz,
+/// resampling automatically when needed. Returns (samples, was_converted).
+pub fn read_wav_mono_24k(path: &Path) -> io::Result<(Vec<f32>, bool)> {
+    let (samples, sr) = read_wav(path)?;
+    if sr == 24000 {
+        return Ok((samples, false));
+    }
+    Ok((resample_mono(&samples, sr, 24000), true))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f32::consts::PI;
+
+    fn sine(sr: u32, freq: f32, secs: f32) -> Vec<f32> {
+        let n = (sr as f32 * secs) as usize;
+        (0..n).map(|i| (2.0 * PI * freq * i as f32 / sr as f32).sin()).collect()
+    }
+
+    fn rms(x: &[f32]) -> f32 {
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    }
+
+    fn zero_crossings(x: &[f32]) -> usize {
+        x.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count()
+    }
+
+    #[test]
+    fn test_resample_identity() {
+        let x = sine(24000, 440.0, 0.1);
+        let y = resample_mono(&x, 24000, 24000);
+        assert_eq!(y, x);
+    }
+
+    #[test]
+    fn test_resample_48k_to_24k() {
+        let x = sine(48000, 1000.0, 1.0);
+        let y = resample_mono(&x, 48000, 24000);
+        assert_eq!(y.len(), 24000);
+        // 1kHz preserved: ~2000 zero crossings/sec
+        let zc = zero_crossings(&y);
+        assert!((1900..2100).contains(&zc), "zc={zc}");
+        // level preserved
+        assert!((rms(&y) - rms(&x)).abs() < 0.02, "rms {} vs {}", rms(&y), rms(&x));
+    }
+
+    #[test]
+    fn test_resample_16k_to_24k() {
+        let x = sine(16000, 500.0, 0.5);
+        let y = resample_mono(&x, 16000, 24000);
+        assert_eq!(y.len(), 12000);
+        let zc = zero_crossings(&y);
+        assert!((450..550).contains(&zc), "zc={zc}");
+    }
+
+    #[test]
+    fn test_resample_empty() {
+        assert!(resample_mono(&[], 48000, 24000).is_empty());
+    }
+
+    fn speech_frame() -> Vec<f32> {
+        vec![0.1; 480] // energy 0.01 >> 1e-4
+    }
+
+    #[test]
+    fn test_trim_silence_compresses_gap() {
+        // speech + 1s silence (50 frames) + speech, max_gap 0.25s (13 frames ceil)
+        let mut x = speech_frame();
+        x.extend(vec![0.0; 480 * 50]);
+        x.extend(speech_frame());
+        let y = trim_silence(&x, 24000, 0.25);
+        // 1 + 13 + 1 frames
+        assert_eq!(y.len(), 480 * 15, "len={}", y.len());
+    }
+
+    #[test]
+    fn test_trim_silence_cuts_trailing() {
+        let mut x = speech_frame();
+        x.extend(vec![0.0; 480 * 50]);
+        let y = trim_silence(&x, 24000, 0.25);
+        assert_eq!(y.len(), 480 * 14, "len={}", y.len()); // 1 speech + 13 gap
+    }
+
+    #[test]
+    fn test_trim_silence_short_gap_untouched() {
+        // 0.2s gap < 0.25s max → unchanged
+        let mut x = speech_frame();
+        x.extend(vec![0.0; 480 * 10]);
+        x.extend(speech_frame());
+        let y = trim_silence(&x, 24000, 0.25);
+        assert_eq!(y, x);
+    }
+
+    #[test]
+    fn test_trim_silence_all_silence() {
+        let x = vec![0.0; 480 * 5];
+        assert!(trim_silence(&x, 24000, 0.25).is_empty());
+    }
+
+    #[test]
+    fn test_trim_silence_leading_kept() {
+        // leading silence shorter than max is kept (only internal/trailing touched)
+        let mut x = vec![0.0; 480 * 5];
+        x.extend(speech_frame());
+        let y = trim_silence(&x, 24000, 0.25);
+        assert_eq!(y, x);
+    }
+}
+
+/// Compress internal silences longer than `max_gap_secs` down to `max_gap_secs`
+/// and trim trailing silence beyond `max_gap_secs`.
+/// Frame = 20ms, speech threshold = mean square energy >= 1e-4
+/// (same convention as the analysis scripts in docs).
+pub fn trim_silence(audio: &[f32], sample_rate: u32, max_gap_secs: f32) -> Vec<f32> {
+    if audio.is_empty() || max_gap_secs <= 0.0 {
+        return audio.to_vec();
+    }
+    let frame = (sample_rate as usize / 50).max(1);
+    let max_gap_frames = ((max_gap_secs * sample_rate as f32) / frame as f32).ceil() as usize;
+
+    // Classify frames
+    let n_frames = audio.len().div_ceil(frame);
+    let mut is_speech = vec![false; n_frames];
+    for (i, s) in is_speech.iter_mut().enumerate() {
+        let end = ((i + 1) * frame).min(audio.len());
+        let seg = &audio[i * frame..end];
+        let e: f32 = seg.iter().map(|v| v * v).sum::<f32>() / seg.len() as f32;
+        *s = e >= 1e-4;
+    }
+
+    // Find last speech frame; drop everything after last_speech + max_gap_frames
+    let Some(last_speech) = is_speech.iter().rposition(|&s| s) else {
+        return Vec::new();
+    };
+    let keep_frames = (last_speech + 1 + max_gap_frames).min(n_frames);
+
+    // Copy, skipping the middle of over-long internal gaps
+    let mut out: Vec<f32> = Vec::with_capacity(audio.len());
+    let mut i = 0;
+    while i < keep_frames {
+        if is_speech[i] {
+            let end = ((i + 1) * frame).min(audio.len());
+            out.extend_from_slice(&audio[i * frame..end]);
+            i += 1;
+        } else {
+            let mut j = i;
+            while j < keep_frames && !is_speech[j] {
+                j += 1;
+            }
+            let gap = j - i;
+            let keep = gap.min(max_gap_frames);
+            for k in i..i + keep {
+                let end = ((k + 1) * frame).min(audio.len());
+                out.extend_from_slice(&audio[k * frame..end]);
+            }
+            i = j;
+        }
+    }
+    out
+}

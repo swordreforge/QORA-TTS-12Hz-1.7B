@@ -13,6 +13,7 @@ convert_model.rs
 test_q4_load.*
 model/0.6B/model.qora-tts
 model/1.7B/model.qora-tts
+model/speech_tokenizer-model.safetensors
 COMPRESSION_GUIDE.md
 IMPLEMENTATION_COMPLETE.md
 README_VOICE_CLONING.md

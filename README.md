@@ -71,6 +71,7 @@ vocab.json            2.7 MB   Vocabulary
 merges.txt            1.6 MB   BPE merges
 tokenizer_config.json 7.2 KB   Tokenizer config
 voices/                         25 reference WAV files for voice cloning
+speech_tokenizer/model.safetensors  651 MB  Codec encoder (only needed for --ref-text ICL mode)
 ```
 
 **No safetensors needed.** Everything loads from `model.qora-tts`. The exe auto-finds all files in its own directory.
@@ -130,9 +131,10 @@ System: 16384 MB RAM (9856 MB free), 12 threads
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--text <text>` | "Hello, how are you today?" | Text to synthesize |
-| `--ref-audio <wav>` | - | **Required** - reference WAV for voice cloning (24kHz mono, 3-10s clean speech) |
+| `--ref-audio <wav>` | - | **Required** - reference WAV for voice cloning (any sample rate: auto-resampled to 24kHz mono; 3-10s clean speech) |
 | `--ref-text <text>` | - | Reference transcript → ICL mode: prosody (pauses/intonation/rate) follows the reference. **Must be accurate, punctuation included** |
 | `--encoder-weights <file>` | `<exe-dir>/speech_tokenizer/model.safetensors` | Codec encoder weights, only needed for ICL mode |
+| `--trim-silence <secs>` | 0 (off) | Compress internal/trailing silences longer than this to the given length (0.25 recommended) |
 | `--language <name>` | english | Target language |
 | `--output <path>` | output.wav | Output WAV path |
 | `--max-codes <n>` | 500 | Max code timesteps (~n/12.5 seconds) |
