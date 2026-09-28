@@ -38,29 +38,37 @@ CPU-only — no GPU needed. Pre-built binaries on the [Releases](https://github.
 2. Run:
 
 ```bash
-# Voice cloning with included voice
+# 0. Self-check first (files, LFS pointers, CPU/RAM) — exits 0/1
+qora-tts.exe --check
+qora-tts.exe --check my_recording.wav   # + reference-audio analysis
+
+# 1. Basic voice cloning (timbre only)
 qora-tts.exe --ref-audio voices/luna.wav --text "Hello, how are you?" --language english
 
-# Different voice
-qora-tts.exe --ref-audio voices/adam.wav --text "Good morning!" --language english
+# 2. Clone your own voice (any sample rate: auto-resampled to 24kHz)
+qora-tts.exe --ref-audio my_recording.wav --text "Custom voice" --language chinese
 
-# Clone your own voice (any 24kHz WAV)
-qora-tts.exe --ref-audio my_recording.wav --text "Custom voice" --language english
-
-# Control length (codes = seconds x 12.5)
-qora-tts.exe --ref-audio voices/luna.wav --text "Short" --max-codes 100
-
-# Custom output path
-qora-tts.exe --ref-audio voices/sagar.wav --text "Hi there" --language english --output greeting.wav
-
-# Reproducible output with seed (the actual seed is printed each run when omitted)
-qora-tts.exe --ref-audio voices/luna.wav --text "Same every time" --seed 42
-
-# ICL mode: clone prosody too (needs reference transcript WITH punctuation)
+# 3. ICL mode: clone prosody too (needs reference transcript WITH punctuation)
 qora-tts.exe --ref-audio my_recording.wav --ref-text "Hello, how are you today?" --text "Custom voice" --language english
 
-# Long text: per-sentence synthesis with crossfade join
+# 4. Reuse a voice: save once, skip encoder runs afterwards (ICL+11s ref: 79s -> 36s)
+qora-tts.exe --ref-audio my_recording.wav --ref-text "Hello, how are you today?" --text "First run" --save-voice luna.qvoice
+qora-tts.exe --ref-audio my_recording.wav --ref-text "Hello, how are you today?" --text "Second run" --load-voice luna.qvoice --output second.wav
+
+# 5. Long article: per-sentence synthesis + crossfade join + silence trim
 qora-tts.exe --ref-audio my_recording.wav --text-file article.txt --trim-silence 0.25 --output article.wav
+
+# 6. The works: ICL voice + profile + long text + trim
+qora-tts.exe --ref-audio my_recording.wav --ref-text "Hello, how are you today?" --text-file article.txt --load-voice luna.qvoice --trim-silence 0.25 --output article.wav
+
+# 7. Reproducible output (the actual seed is printed each run when omitted)
+qora-tts.exe --ref-audio voices/luna.wav --text "Same every time" --seed 42
+
+# 8. Quick preview: cap length (codes = seconds x 12.5, 100 ~= 8s audio max)
+qora-tts.exe --ref-audio voices/luna.wav --text "Short preview" --max-codes 100
+
+# 9. Tune randomness (higher temperature = livelier prosody)
+qora-tts.exe --ref-audio voices/adam.wav --text "Good morning!" --temperature 1.0 --top-k 80
 ```
 
 ## Files
