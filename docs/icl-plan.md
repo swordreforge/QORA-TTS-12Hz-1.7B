@@ -40,6 +40,10 @@ RVQ `num_quantizers=32`、`encoder_valid_num_quantizers=16`、`num_semantic_quan
 ## 3. 总体方案（分三阶段，每阶段独立 commit、可回退）
 
 - **Phase A**：拿权重 → 精读官方 encoder 源码 → Rust 移植 encoder → **离线验证**（门禁）。
+  ✅ 已完成（2026-09-28）：`src/codec_encoder.rs` 前向全实现，与官方 torch 版
+  逐阶段对齐（seanet/transformer/downsample 最大差 <1e-3，16×23 码 100% 一致），
+  黄金往返 corr=0.9676。途中修掉 `mimi_conv_forward` 通道数参数脚枪
+  （改用 `conv.in_ch`，见 commit）。
 - **Phase B**：移植 `generate_icl_prompt` → `--ref-text` 接线 + 双开关 → 无 ref-text 时行为零变化。
 - **Phase C**：同 seed A/B 评测 + 回归 + 性能记录。
 
