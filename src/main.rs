@@ -24,6 +24,7 @@ fn main() {
     let mut ref_text: Option<String> = None;
     let mut encoder_weights_path: Option<PathBuf> = None;
     let mut trim_silence: f32 = 0.0;
+    let mut text_file: Option<PathBuf> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -115,6 +116,12 @@ fn main() {
             "--trim-silence" => {
                 if i + 1 < args.len() {
                     trim_silence = args[i + 1].parse().unwrap_or(0.0);
+                    i += 1;
+                }
+            }
+            "--text-file" => {
+                if i + 1 < args.len() {
+                    text_file = Some(PathBuf::from(&args[i + 1]));
                     i += 1;
                 }
             }
@@ -293,24 +300,53 @@ fn main() {
             _ => (None, None),
         };
 
-    // === CPU inference ===
-    let audio = qora_tts::generate_new::generate_speech(
-        &talker, &predictor, &decoder, &tokenizer,
-        &text, speaker_id, language_id,
-        voice_codes.as_deref(),
-        voice_embedding.as_deref(),
-        &qora_tts::generate_new::TTSParams {
-            max_codes,
-            temperature,
-            top_k,
-            repetition_penalty: 1.05,
-            codec_eos_id: 2150,
-            codec_bos_id: 2149,
-        },
-        seed,
-        ref_text_tokens,
-        ref_codes.as_deref(),
-    );
+    // === CPU inference (per chunk; --text-file splits long text) ===
+    let chunks: Vec<String> = if let Some(ref tf) = text_file {
+        let content = std::fs::read_to_string(tf).unwrap_or_else(|e| {
+            eprintln!("Failed to read text file {}: {e}", tf.display());
+            std::process::exit(1);
+        });
+        let parts = qora_tts::chunk::split_sentences(&content);
+        if parts.is_empty() {
+            eprintln!("Text file produced no chunks");
+            std::process::exit(1);
+        }
+        eprintln!("Text file: {} chunks", parts.len());
+        parts
+    } else {
+        vec![text.clone()]
+    };
+    let mut audios: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+    for (idx, chunk_text) in chunks.iter().enumerate() {
+        if chunks.len() > 1 {
+            eprintln!("--- Chunk {}/{} ({} chars) ---", idx + 1, chunks.len(), chunk_text.chars().count());
+        }
+        // Deterministic per-chunk seeds when a base seed is given
+        let chunk_seed = seed.map(|s| s.wrapping_add(idx as u64));
+        audios.push(qora_tts::generate_new::generate_speech(
+            &talker, &predictor, &decoder, &tokenizer,
+            chunk_text, speaker_id, language_id,
+            voice_codes.as_deref(),
+            voice_embedding.as_deref(),
+            &qora_tts::generate_new::TTSParams {
+                max_codes,
+                temperature,
+                top_k,
+                repetition_penalty: 1.05,
+                codec_eos_id: 2150,
+                codec_bos_id: 2149,
+            },
+            chunk_seed,
+            ref_text_tokens.clone(),
+            ref_codes.as_deref(),
+        ));
+    }
+    // 30ms crossfade between chunks to avoid clicks
+    let audio = if audios.len() > 1 {
+        qora_tts::chunk::crossfade_concat(&audios, 720)
+    } else {
+        audios.into_iter().next().unwrap()
+    };
 
     // Optional silence compression (internal gaps + trailing tail)
     let audio = if trim_silence > 0.0 {

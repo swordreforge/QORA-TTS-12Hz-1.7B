@@ -15,4 +15,5 @@ pub mod save;
 pub mod audio_features;
 pub mod speaker_encoder;
 pub mod codec_encoder;
+pub mod chunk;
 pub mod system;

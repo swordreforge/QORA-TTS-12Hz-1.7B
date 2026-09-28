@@ -58,6 +58,9 @@ qora-tts.exe --ref-audio voices/luna.wav --text "Same every time" --seed 42
 
 # ICL mode: clone prosody too (needs reference transcript WITH punctuation)
 qora-tts.exe --ref-audio my_recording.wav --ref-text "Hello, how are you today?" --text "Custom voice" --language english
+
+# Long text: per-sentence synthesis with crossfade join
+qora-tts.exe --ref-audio my_recording.wav --text-file article.txt --trim-silence 0.25 --output article.wav
 ```
 
 ## Files
@@ -131,6 +134,7 @@ System: 16384 MB RAM (9856 MB free), 12 threads
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--text <text>` | "Hello, how are you today?" | Text to synthesize |
+| `--text-file <path>` | - | Long text file: auto-split into sentences, synthesized per chunk, joined with 30ms crossfade (deterministic per-chunk seeds when `--seed` given) |
 | `--ref-audio <wav>` | - | **Required** - reference WAV for voice cloning (any sample rate: auto-resampled to 24kHz mono; 3-10s clean speech) |
 | `--ref-text <text>` | - | Reference transcript → ICL mode: prosody (pauses/intonation/rate) follows the reference. **Must be accurate, punctuation included** |
 | `--encoder-weights <file>` | `<exe-dir>/speech_tokenizer/model.safetensors` | Codec encoder weights, only needed for ICL mode |
