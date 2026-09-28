@@ -197,7 +197,64 @@ pub fn analyze_wav(path: &Path) -> Vec<CheckItem> {
             format!("{:.0}% silence", ratio * 100.0)
         },
     });
+    // ICL handoff: generation starts conditioned on the reference ENDING
+    // (last codec frames). A rough/creaky tail (e.g. low 3rd-tone decay)
+    // bleeds into every chunk attack as onset smokiness. Flag it here.
+    items.push(ending_quality(&samples, sr));
     items
+}
+
+/// HNR (periodicity strength) of one window; None if near-silent.
+fn window_hnr(seg: &[f32], sr: u32) -> Option<f32> {
+    let n = seg.len();
+    let e: f32 = seg.iter().map(|v| v * v).sum::<f32>() / n as f32;
+    if e < 1e-6 {
+        return None;
+    }
+    let mut best = 0.0f32;
+    let max_lag = (sr as usize / 40).min(n / 2);
+    for lag in (sr as usize / 400).max(1)..=max_lag {
+        let r: f32 = seg.iter().take(n - lag).zip(&seg[lag..]).map(|(a, b)| a * b).sum::<f32>()
+            / (n - lag) as f32
+            / e;
+        if r > best {
+            best = r;
+        }
+    }
+    Some(best)
+}
+
+/// Ending quality over the last 1.0s (voiced 0.25s windows only).
+fn ending_quality(samples: &[f32], sr: u32) -> CheckItem {
+    let win = (sr as usize / 4).max(1);
+    let start = samples.len().saturating_sub(sr as usize);
+    let mut worst = 1.0f32;
+    let mut voiced = 0usize;
+    let mut i = start;
+    while i < samples.len() {
+        let end = (i + win).min(samples.len());
+        if let Some(h) = window_hnr(&samples[i..end], sr) {
+            voiced += 1;
+            worst = worst.min(h);
+        }
+        i = end;
+    }
+    if voiced == 0 {
+        return CheckItem {
+            name: "ending".into(),
+            ok: false,
+            detail: "last 1s is silent, ICL handoff starts from nothing".into(),
+        };
+    }
+    CheckItem {
+        name: "ending".into(),
+        ok: worst >= 0.6,
+        detail: if worst >= 0.6 {
+            format!("last 1s voiced, min HNR {worst:.2} (clean handoff)")
+        } else {
+            format!("last 1s min HNR {worst:.2}: rough tail will bleed into chunk attacks, trim or re-cut the reference")
+        },
+    }
 }
 
 /// Channel count from the WAV header (read_wav mixes down to mono).
@@ -281,6 +338,35 @@ mod tests {
     fn test_analyze_missing_file() {
         let items = analyze_wav(&tmp("nope.wav"));
         assert!(!items[0].ok);
+    }
+
+    #[test]
+    fn test_ending_clean_passes() {
+        // 3s clean tone: ending must pass
+        let p = tmp("endclean.wav");
+        crate::wav::write_wav(&p, &sine_24k(3.0, 0.3), 24000).unwrap();
+        let items = analyze_wav(&p);
+        let e = items.iter().find(|i| i.name == "ending").unwrap();
+        assert!(e.ok, "{}", e.detail);
+    }
+
+    #[test]
+    fn test_ending_rough_tail_flagged() {
+        // clean tone + rough (noise) last 0.6s: ending must fail
+        let p = tmp("endrough.wav");
+        let mut x = sine_24k(3.0, 0.3);
+        let tail = x.len() - 14400;
+        let mut st: u64 = 42;
+        for v in x.iter_mut().skip(tail) {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            *v = ((st % 2000) as f32 / 1000.0 - 1.0) * 0.2;
+        }
+        crate::wav::write_wav(&p, &x, 24000).unwrap();
+        let items = analyze_wav(&p);
+        let e = items.iter().find(|i| i.name == "ending").unwrap();
+        assert!(!e.ok, "{}", e.detail);
     }
 
     #[test]
