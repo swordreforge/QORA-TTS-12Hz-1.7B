@@ -199,7 +199,14 @@ fn main() {
         eprintln!("WARNING: {msg}");
     }
 
-    eprintln!("Text: \"{text}\"");
+    // NOTE: `text` defaults to "Hello, how are you today?" only when neither
+    // --text nor --text-file is given; with --text-file the real input is
+    // split into chunks later (see "Text file:" line).
+    if text_file.is_some() {
+        eprintln!("Text: <from {}>", text_file.as_ref().unwrap().display());
+    } else {
+        eprintln!("Text: \"{text}\"");
+    }
     if voice_codes_path.is_some() {
         eprintln!("Voice: custom (from .codes file)");
     } else {
@@ -465,15 +472,41 @@ fn main() {
             ref_codes.as_deref(),
         ));
     }
-    // 30ms crossfade between chunks to avoid clicks
-    let audio = if audios.len() > 1 {
-        qora_tts::chunk::crossfade_concat(&audios, 720)
+    // 30ms crossfade between chunks to avoid clicks.
+    // Seam hygiene: trim each chunk BEFORE joining (when requested) so the
+    // crossfade blends silence into silence. Trimming after the join cannot
+    // undo a speech-on-speech crossfade already baked into the seam.
+    // (Single-chunk runs trim once below; multi-chunk tails are covered by
+    // the per-chunk pass, so no final pass is needed there.)
+    let multi = audios.len() > 1;
+    let audio = if multi {
+        // Seam hygiene: per-chunk trim (if requested) + guaranteed 0.15s
+        // tail pad, THEN crossfade. The pad makes hot tails end in digital
+        // silence so the 30ms fade blends silence into attack instead of
+        // mixing two phonemes (the glitch seen in long-form runs).
+        let joined: Vec<Vec<f32>> = if trim_silence > 0.0 {
+            eprintln!("Trimming {} chunks (>{trim_silence}s) before join...", audios.len());
+            audios
+                .iter()
+                .map(|a| {
+                    let t = qora_tts::wav::trim_silence(a, 24000, trim_silence);
+                    qora_tts::chunk::pad_tail(&t, 24000, 0.15)
+                })
+                .collect()
+        } else {
+            audios
+                .iter()
+                .map(|a| qora_tts::chunk::pad_tail(a, 24000, 0.15))
+                .collect()
+        };
+        qora_tts::chunk::crossfade_concat(&joined, 720)
     } else {
         audios.into_iter().next().unwrap()
     };
 
-    // Optional silence compression (internal gaps + trailing tail)
-    let audio = if trim_silence > 0.0 {
+    // Optional silence compression for single-chunk output
+    // (internal gaps + trailing tail).
+    let audio = if trim_silence > 0.0 && !multi {
         let before = audio.len();
         let trimmed = qora_tts::wav::trim_silence(&audio, 24000, trim_silence);
         eprintln!("Trim silence (>{trim_silence}s): {} -> {} samples ({:.2}s -> {:.2}s)",

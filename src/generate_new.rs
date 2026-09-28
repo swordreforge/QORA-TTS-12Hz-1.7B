@@ -431,6 +431,18 @@ pub fn generate_speech(
 
     eprintln!("\nGeneration done in {:.1?} ({} frames)", t_gen.elapsed(), all_codes[0].len());
 
+    // Diagnostic dump of generated codes (VCOD format, same as --voice-codes
+    // input). Gated by QORA_DUMP_CODES=<path>; used to inspect frame-level
+    // patterns behind audible artifacts (stuck runs, oscillation, thrash).
+    if let Ok(dump_path) = std::env::var("QORA_DUMP_CODES") {
+        if let Err(e) = write_codes_file(std::path::Path::new(&dump_path), &all_codes) {
+            eprintln!("Failed to dump codes to {dump_path}: {e}");
+        } else {
+            eprintln!("Codes dumped to {dump_path} ({} codebooks x {} frames)",
+                all_codes.len(), all_codes[0].len());
+        }
+    }
+
     // Decode to audio
     let t_decode = Instant::now();
     let audio = crate::decoder::decode_to_audio(decoder, &all_codes);
@@ -440,9 +452,24 @@ pub fn generate_speech(
     audio
 }
 
+/// Write codes in VCOD format (magic + u32 groups + u32 frames + u16 codes,
+/// group-major), readable by --voice-codes / load_all_voice_codes.
+fn write_codes_file(path: &std::path::Path, codes: &[Vec<u32>]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    f.write_all(b"VCOD")?;
+    f.write_all(&(codes.len() as u32).to_le_bytes())?;
+    f.write_all(&(codes[0].len() as u32).to_le_bytes())?;
+    for q in codes {
+        for &c in q {
+            f.write_all(&(c as u16).to_le_bytes())?;
+        }
+    }
+    f.flush()
+}
+
 /// Build trailing text embeddings: text_proj(text[1..]) + TTS_EOS
-fn build_trailing_text(talker: &TalkerWeights, text_tokens: &[u32]) -> Vec<Vec<f32>> {
-    let mut trailing = Vec::new();
+fn build_trailing_text(talker: &TalkerWeights, text_tokens: &[u32]) -> Vec<Vec<f32>> {    let mut trailing = Vec::new();
 
     // Add remaining text tokens (skip first token which was used in prefill)
     for &token_id in text_tokens.iter().skip(1) {
@@ -556,5 +583,32 @@ mod tests {
         let l = icl_block_layout(1, 1, 23);
         assert_eq!(l.icl_len, 24);
         assert_eq!(l.remainder_len, 0);
+    }
+}
+
+#[cfg(test)]
+mod codes_tests {
+    use super::*;
+
+    #[test]
+    fn test_codes_roundtrip() {
+        let codes = vec![vec![1u32, 2047, 0], vec![4095u32, 7, 13]];
+        let p = std::env::temp_dir().join("qora_codes_rt.vcod");
+        write_codes_file(&p, &codes).unwrap();
+        // read back with the same layout main.rs uses
+        use std::io::Read;
+        let mut f = std::fs::File::open(&p).unwrap();
+        let mut magic = [0u8; 4];
+        f.read_exact(&mut magic).unwrap();
+        assert_eq!(&magic, b"VCOD");
+        let mut b4 = [0u8; 4];
+        f.read_exact(&mut b4).unwrap();
+        assert_eq!(u32::from_le_bytes(b4), 2);
+        f.read_exact(&mut b4).unwrap();
+        assert_eq!(u32::from_le_bytes(b4), 3);
+        let mut raw = vec![0u8; 12];
+        f.read_exact(&mut raw).unwrap();
+        let vals: Vec<u32> = raw.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as u32).collect();
+        assert_eq!(vals, vec![1, 2047, 0, 4095, 7, 13]);
     }
 }

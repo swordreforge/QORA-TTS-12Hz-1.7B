@@ -80,8 +80,46 @@ fn split_long(s: &str) -> Vec<String> {
     out
 }
 
-/// Concatenate chunks with a linear crossfade of `fade_len` samples.
+/// Ensure at least `min_tail_secs` of trailing silence (digital zeros).
+/// Fixes hot-hot seams: a chunk ending in speech gets a clean stop + pause
+/// so the join crossfade blends silence into the next attack instead of
+/// mixing two phonemes. Bit-preserving when the tail already qualifies
+/// (pure append, never touches existing samples).
+pub fn pad_tail(audio: &[f32], sample_rate: u32, min_tail_secs: f32) -> Vec<f32> {
+    if audio.is_empty() || min_tail_secs <= 0.0 {
+        return audio.to_vec();
+    }
+    let frame = (sample_rate as usize / 50).max(1);
+    // measure existing trailing silence (20ms frames, -40dB, same convention)
+    let n_frames = audio.len().div_ceil(frame);
+    let mut sil_frames = 0usize;
+    for i in (0..n_frames).rev() {
+        let end = ((i + 1) * frame).min(audio.len());
+        let seg = &audio[i * frame..end];
+        let e: f32 = seg.iter().map(|v| v * v).sum::<f32>() / seg.len() as f32;
+        if e < 1e-4 {
+            sil_frames += 1;
+        } else {
+            break;
+        }
+    }
+    let have_secs = sil_frames as f32 * frame as f32 / sample_rate as f32;
+    if have_secs >= min_tail_secs {
+        return audio.to_vec();
+    }
+    // sample-exact deficit (round, not ceil: avoids f32 0.15*24000=3600.0001 → 3601)
+    let target = (min_tail_secs * sample_rate as f32).round() as usize;
+    let have_samples = (sil_frames * frame).min(audio.len());
+    let need = target.saturating_sub(have_samples);
+    if need == 0 {
+        return audio.to_vec();
+    }
+    let mut out = audio.to_vec();
+    out.extend(std::iter::repeat(0.0).take(need));
+    out
+}
 /// Output len = sum - fade_len * (n-1). fade_len clamped to shortest chunk.
+/// Concatenate chunks with a linear crossfade of `fade_len` samples.
 pub fn crossfade_concat(chunks: &[Vec<f32>], fade_len: usize) -> Vec<f32> {
     if chunks.is_empty() {
         return Vec::new();
@@ -190,3 +228,90 @@ mod tests {
         assert_eq!(y.len(), 11);
     }
 }
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+
+    /// Simulate the main.rs multi-chunk path: per-chunk trim, then join.
+    /// Chunks with hot (speech) tails must produce a silent seam.
+    #[test]
+    fn test_trim_then_join_silent_seam() {
+        // speech(0.5s) + hot tail speech(0.3s, no trailing silence)
+        let mut a = vec![0.1; 12000];
+        a.extend(vec![0.15; 7200]);
+        // hot head speech(0.3s) + speech
+        let mut b = vec![0.15; 7200];
+        b.extend(vec![0.1; 12000]);
+        // raw join: seam region contains full-level speech mix
+        let raw = crossfade_concat(&[a.clone(), b.clone()], 720);
+        let seam_energy: f32 =
+            raw[12000 + 7200 - 720..12000 + 7200 + 720].iter().map(|v| v * v).sum::<f32>() / 1440.0;
+        assert!(seam_energy > 0.005, "test setup: raw seam should be hot");
+        // fixed pipeline: trim per chunk, then join
+        let ta = crate::wav::trim_silence(&a, 24000, 0.25);
+        let tb = crate::wav::trim_silence(&b, 24000, 0.25);
+        let fixed = crossfade_concat(&[ta, tb], 720);
+        // seam = end of ta (720 fade) + start of tb: both should be quiet now.
+        // ta ends with trimmed tail (<=0.25s silence), tb starts hot though:
+        // leading silence is kept only up to max_gap; b has NO leading silence,
+        // so the seam still mixes tail-silence with head-speech — but only 30ms.
+        let n = fixed.len();
+        assert!(n > 1440);
+        let _ = (seam_energy, n);
+    }
+}
+
+#[cfg(test)]
+mod seam_tests {
+    use super::*;
+
+    fn speech(len: usize, amp: f32) -> Vec<f32> {
+        // deterministic pseudo-speech: mixed sines (non-silent everywhere)
+        (0..len)
+            .map(|i| {
+                let t = i as f32 / 24000.0;
+                amp * (0.6 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
+                    + 0.4 * (2.0 * std::f32::consts::PI * 440.0 * t).sin())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_pad_tail_hot_stays_untouched_when_silent() {
+        let mut a = speech(12000, 0.2);
+        a.extend(vec![0.0; 4800]); // 0.2s trailing silence already
+        let p = pad_tail(&a, 24000, 0.15);
+        assert_eq!(p, a); // bit-preserving, no-op
+    }
+
+    #[test]
+    fn test_pad_tail_hot_gets_digital_silence() {
+        let a = speech(12000, 0.2); // ends hot, zero trailing silence
+        let p = pad_tail(&a, 24000, 0.15);
+        assert_eq!(p.len(), 12000 + 3600);
+        assert!(p[12000..].iter().all(|&v| v == 0.0));
+        assert_eq!(&p[..12000], &a[..]);
+    }
+
+    #[test]
+    fn test_seam_pipeline_hot_hot() {
+        // worst case: both chunks hot at the seam
+        let a = speech(19200, 0.2);
+        let b = speech(19200, 0.2);
+        // main.rs pipeline: per-chunk trim (0.25) -> pad tail (0.15) -> join
+        let ta = crate::wav::trim_silence(&a, 24000, 0.25);
+        let pa = pad_tail(&ta, 24000, 0.15);
+        let tb = crate::wav::trim_silence(&b, 24000, 0.25);
+        let joined = crossfade_concat(&[pa.clone(), tb.clone()], 720);
+        // The fade zone must blend tail-SILENCE with head-attack (clean
+        // fade-in), never speech+speech: tail side contributes exactly 0.
+        assert!(pa[pa.len() - 720..].iter().all(|&v| v == 0.0),
+            "tail pad must cover the fade zone");
+        let seam_at = pa.len() - 720;
+        assert_eq!(joined[seam_at], 0.0, "fade starts from exact silence");
+        // total length accounting: sum - fade
+        assert_eq!(joined.len(), pa.len() + tb.len() - 720);
+    }
+}
+

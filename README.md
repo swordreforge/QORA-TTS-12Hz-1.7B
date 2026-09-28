@@ -69,6 +69,9 @@ qora-tts.exe --ref-audio voices/luna.wav --text "Short preview" --max-codes 100
 
 # 9. Tune randomness (higher temperature = livelier prosody)
 qora-tts.exe --ref-audio voices/adam.wav --text "Good morning!" --temperature 1.0 --top-k 80
+
+# 10. Diagnose artifacts: dump frame-level codes (VCOD) for inspection
+QORA_DUMP_CODES=debug.codes qora-tts.exe --ref-audio my_recording.wav --text "Suspect sentence" --seed 42
 ```
 
 ## Files
