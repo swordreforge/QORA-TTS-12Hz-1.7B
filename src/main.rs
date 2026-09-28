@@ -25,6 +25,8 @@ fn main() {
     let mut encoder_weights_path: Option<PathBuf> = None;
     let mut trim_silence: f32 = 0.0;
     let mut text_file: Option<PathBuf> = None;
+    let mut load_voice_path: Option<PathBuf> = None;
+    let mut save_voice_path: Option<PathBuf> = None;
     let mut check_target: Option<Option<PathBuf>> = None;
     let mut i = 1;
     while i < args.len() {
@@ -123,6 +125,18 @@ fn main() {
             "--text-file" => {
                 if i + 1 < args.len() {
                     text_file = Some(PathBuf::from(&args[i + 1]));
+                    i += 1;
+                }
+            }
+            "--load-voice" => {
+                if i + 1 < args.len() {
+                    load_voice_path = Some(PathBuf::from(&args[i + 1]));
+                    i += 1;
+                }
+            }
+            "--save-voice" => {
+                if i + 1 < args.len() {
+                    save_voice_path = Some(PathBuf::from(&args[i + 1]));
                     i += 1;
                 }
             }
@@ -252,23 +266,71 @@ fn main() {
 
     // Load reference audio once (auto-resampled to 24kHz mono) for both
     // the speaker embedding and, in ICL mode, the codec encoder.
-    let ref_audio_24k: Option<Vec<f32>> = if let Some(ref ref_path) = ref_audio_path {
-        eprintln!("Loading reference audio {}...", ref_path.display());
-        let (audio, converted) = qora_tts::wav::read_wav_mono_24k(ref_path)
-            .unwrap_or_else(|e| {
+    // Raw bytes are hashed for voice-profile freshness checks.
+    let (ref_audio_24k, ref_audio_hash): (Option<Vec<f32>>, Option<[u8; 32]>) =
+        if let Some(ref ref_path) = ref_audio_path {
+            eprintln!("Loading reference audio {}...", ref_path.display());
+            let raw = std::fs::read(ref_path).unwrap_or_else(|e| {
                 eprintln!("Failed to load reference audio: {e}");
                 std::process::exit(1);
             });
-        if converted {
-            eprintln!("Reference resampled to 24kHz mono ({} samples)", audio.len());
+            let hash = qora_tts::voice_profile::hash_bytes(&raw);
+            let (audio, converted) = qora_tts::wav::read_wav_mono_24k(ref_path)
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to load reference audio: {e}");
+                    std::process::exit(1);
+                });
+            if converted {
+                eprintln!("Reference resampled to 24kHz mono ({} samples)", audio.len());
+            }
+            (Some(audio), Some(hash))
+        } else {
+            (None, None)
+        };
+
+    // Voice profile cache ("style file"): text-independent conditioning
+    // (embedding + ICL codes) reused across runs. Embedding usable iff the
+    // audio hash matches; codes additionally require ref_text equality.
+    // Anything unusable is recomputed below; --save-voice stores the result.
+    struct ProfileHit {
+        embedding: Option<Vec<f32>>,
+        codes: Option<Vec<Vec<u32>>>,
+    }
+    let profile_hit: ProfileHit = match (&load_voice_path, &ref_audio_hash) {
+        (Some(pp), Some(hash)) => match qora_tts::voice_profile::load_profile(pp) {
+            Err(e) => {
+                eprintln!("Voice profile {} unusable ({e}), recomputing", pp.display());
+                ProfileHit { embedding: None, codes: None }
+            }
+            Ok(prof) if prof.audio_sha256 != *hash => {
+                eprintln!("Voice profile audio mismatch, recomputing");
+                ProfileHit { embedding: None, codes: None }
+            }
+            Ok(prof) => {
+                let codes_ok = prof.ref_text == ref_text;
+                if !codes_ok && ref_text.is_some() {
+                    eprintln!("Voice profile ref_text differs, re-encoding codes");
+                }
+                eprintln!("Voice profile hit: embedding reused{}",
+                    if codes_ok && prof.ref_codes.is_some() { ", codes reused" } else { "" });
+                ProfileHit {
+                    embedding: Some(prof.embedding),
+                    codes: if codes_ok { prof.ref_codes } else { None },
+                }
+            }
+        },
+        (Some(pp), None) => {
+            eprintln!("--load-voice given without --ref-audio, ignoring {}", pp.display());
+            ProfileHit { embedding: None, codes: None }
         }
-        Some(audio)
-    } else {
-        None
+        _ => ProfileHit { embedding: None, codes: None },
     };
 
     // Load speaker encoder and extract voice embedding if --ref-audio provided
-    let voice_embedding: Option<Vec<f32>> = if let Some(ref audio) = ref_audio_24k {
+    let voice_embedding: Option<Vec<f32>> = if let Some(emb) = profile_hit.embedding {
+        eprintln!("Voice embedding from profile: {} dims", emb.len());
+        Some(emb)
+    } else if let Some(ref audio) = ref_audio_24k {
         eprintln!("Loading speaker encoder for voice cloning...");
         let t0 = Instant::now();
         let speaker_encoder = speaker_encoder_opt
@@ -310,30 +372,57 @@ fn main() {
 
     // ICL mode: encode reference audio to codes + tokenize reference text.
     // ref_tokens == official ref_ids[:, 3:-2] (template stripped on both ends).
+    // Profile-cached codes are reused when the audio hash and ref_text match.
     let (ref_text_tokens, ref_codes): (Option<Vec<u32>>, Option<Vec<Vec<u32>>>) =
         match (&ref_text, &ref_audio_24k) {
             (Some(rt), Some(audio_icl)) => {
-                let enc_path = encoder_weights_path.clone().unwrap_or_else(|| {
-                    base_path.join("speech_tokenizer").join("model.safetensors")
-                });
-                eprintln!("ICL mode: loading codec encoder from {}...", enc_path.display());
-                let enc = qora_tts::codec_encoder::load_codec_encoder(&enc_path)
-                    .unwrap_or_else(|e| {
-                        eprintln!("Failed to load codec encoder: {e}");
-                        eprintln!("hint: pass --encoder-weights <speech_tokenizer/model.safetensors>");
-                        std::process::exit(1);
-                    });
-                // Reference audio already loaded + resampled above
-                let t_enc = Instant::now();
-                let codes = qora_tts::codec_encoder::encode_waveform_to_codes(&enc, &audio_icl);
-                eprintln!("Reference encoded to 16x{} codes in {:.1?}",
-                    codes[0].len(), t_enc.elapsed());
                 let toks = tokenizer.encode(rt);
                 eprintln!("Reference text: {} tokens", toks.len());
-                (Some(toks), Some(codes))
+                if let Some(cached) = profile_hit.codes {
+                    eprintln!("Reference codes from profile: 16x{}", cached[0].len());
+                    (Some(toks), Some(cached))
+                } else {
+                    let enc_path = encoder_weights_path.clone().unwrap_or_else(|| {
+                        base_path.join("speech_tokenizer").join("model.safetensors")
+                    });
+                    eprintln!("ICL mode: loading codec encoder from {}...", enc_path.display());
+                    let enc = qora_tts::codec_encoder::load_codec_encoder(&enc_path)
+                        .unwrap_or_else(|e| {
+                            eprintln!("Failed to load codec encoder: {e}");
+                            eprintln!("hint: pass --encoder-weights <speech_tokenizer/model.safetensors>");
+                            std::process::exit(1);
+                        });
+                    // Reference audio already loaded + resampled above
+                    let t_enc = Instant::now();
+                    let codes = qora_tts::codec_encoder::encode_waveform_to_codes(&enc, &audio_icl);
+                    eprintln!("Reference encoded to 16x{} codes in {:.1?}",
+                        codes[0].len(), t_enc.elapsed());
+                    (Some(toks), Some(codes))
+                }
             }
             _ => (None, None),
         };
+
+    // Persist the voice profile if requested (stores whatever was computed
+    // or reused this run: embedding + codes + hash + ref_text).
+    if let Some(ref sp) = save_voice_path {
+        match (&ref_audio_hash, &voice_embedding) {
+            (Some(hash), Some(emb)) => {
+                let prof = qora_tts::voice_profile::VoiceProfile {
+                    audio_len: ref_audio_24k.as_ref().map(|a| a.len() as u64).unwrap_or(0),
+                    audio_sha256: *hash,
+                    ref_text: ref_text.clone(),
+                    embedding: emb.clone(),
+                    ref_codes: ref_codes.clone(),
+                };
+                match qora_tts::voice_profile::save_profile(sp, &prof) {
+                    Ok(()) => eprintln!("Voice profile saved to {}", sp.display()),
+                    Err(e) => eprintln!("Failed to save voice profile: {e}"),
+                }
+            }
+            _ => eprintln!("--save-voice needs --ref-audio, nothing saved"),
+        }
+    }
 
     // === CPU inference (per chunk; --text-file splits long text) ===
     let chunks: Vec<String> = if let Some(ref tf) = text_file {

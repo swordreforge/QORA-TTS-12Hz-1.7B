@@ -18,4 +18,5 @@ pub mod codec_encoder;
 pub mod chunk;
 pub mod gpool;
 pub mod check;
+pub mod voice_profile;
 pub mod system;

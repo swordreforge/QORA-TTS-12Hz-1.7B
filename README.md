@@ -141,6 +141,8 @@ System: 16384 MB RAM (9856 MB free), 12 threads
 | `--trim-silence <secs>` | 0 (off) | Compress internal/trailing silences longer than this to the given length (0.25 recommended) |
 | `--check` | - | Self-test and exit: model/tokenizer files (catches undownloaded git-lfs pointers), ICL sidecar, CPU/RAM |
 | `--check <wav>` | - | Above plus reference-audio analysis (sample rate, duration ≥3s, level, silence ratio) |
+| `--save-voice <file>` | - | Save voice profile (embedding + ICL codes + audio hash, ~13KB) for reuse |
+| `--load-voice <file>` | - | Reuse profile: skips speaker/codec encoder runs (ICL+11s ref: 79s → 36s wall). Falls back to recompute on audio/ref_text mismatch |
 | `--language <name>` | english | Target language |
 | `--output <path>` | output.wav | Output WAV path |
 | `--max-codes <n>` | 500 | Max code timesteps (~n/12.5 seconds) |
