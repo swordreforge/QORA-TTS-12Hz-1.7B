@@ -139,6 +139,8 @@ System: 16384 MB RAM (9856 MB free), 12 threads
 | `--ref-text <text>` | - | Reference transcript → ICL mode: prosody (pauses/intonation/rate) follows the reference. **Must be accurate, punctuation included** |
 | `--encoder-weights <file>` | `<exe-dir>/speech_tokenizer/model.safetensors` | Codec encoder weights, only needed for ICL mode |
 | `--trim-silence <secs>` | 0 (off) | Compress internal/trailing silences longer than this to the given length (0.25 recommended) |
+| `--check` | - | Self-test and exit: model/tokenizer files (catches undownloaded git-lfs pointers), ICL sidecar, CPU/RAM |
+| `--check <wav>` | - | Above plus reference-audio analysis (sample rate, duration ≥3s, level, silence ratio) |
 | `--language <name>` | english | Target language |
 | `--output <path>` | output.wav | Output WAV path |
 | `--max-codes <n>` | 500 | Max code timesteps (~n/12.5 seconds) |

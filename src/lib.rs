@@ -17,4 +17,5 @@ pub mod speaker_encoder;
 pub mod codec_encoder;
 pub mod chunk;
 pub mod gpool;
+pub mod check;
 pub mod system;

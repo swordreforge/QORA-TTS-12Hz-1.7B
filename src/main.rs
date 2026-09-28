@@ -25,6 +25,7 @@ fn main() {
     let mut encoder_weights_path: Option<PathBuf> = None;
     let mut trim_silence: f32 = 0.0;
     let mut text_file: Option<PathBuf> = None;
+    let mut check_target: Option<Option<PathBuf>> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -125,9 +126,43 @@ fn main() {
                     i += 1;
                 }
             }
+            "--check" => {
+                // Optional wav path: --check <file.wav> (only if next arg isn't a flag)
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    check_target = Some(Some(PathBuf::from(&args[i + 1])));
+                    i += 1;
+                } else {
+                    check_target = Some(None);
+                }
+            }
             _ => {}
         }
         i += 1;
+    }
+
+    // Self-test mode: runs before model loading, exits with 0/1
+    if let Some(target) = check_target {
+        eprintln!("QORA-TTS self-check");
+        let (items, runnable) = qora_tts::check::check_env(&exe_dir, &load_path);
+        for it in &items {
+            eprintln!("{}", it.line());
+        }
+        let mut fail = !runnable;
+        if let Some(wav) = target {
+            eprintln!("--- reference audio: {} ---", wav.display());
+            let wavs = qora_tts::check::analyze_wav(&wav);
+            for it in &wavs {
+                eprintln!("{}", it.line());
+            }
+            // 'format'/'sample-rate' notes are informational; the rest must pass
+            fail |= wavs.iter().any(|it| !it.ok && it.name != "sample-rate");
+        }
+        if fail {
+            eprintln!("CHECK FAILED");
+            std::process::exit(1);
+        }
+        eprintln!("CHECK PASSED");
+        return;
     }
 
     // System awareness
