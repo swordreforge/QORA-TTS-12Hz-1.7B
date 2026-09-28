@@ -275,11 +275,14 @@ fn gemv_q4(input: &[f32], weight: &Q4Weight) -> Vec<f32> {
     let k = weight.k;
     let n = weight.n;
 
-    let num_threads = if k * n >= 4_000_000 {
-        std::thread::available_parallelism().map(|p| p.get()).unwrap_or(6)
-    } else {
-        1
-    };
+    // Thread budget proportional to work: ~500K MACs per worker keeps
+    // dispatch overhead negligible while letting the predictor's ~1M-MAC
+    // GEMVs (previously single-threaded under the 4M threshold) parallelize.
+    let workers = crate::gpool::num_workers();
+    let mut num_threads = (k * n / 500_000).clamp(1, workers);
+    if k * n < 500_000 {
+        num_threads = 1;
+    }
 
     if num_threads <= 1 {
         return gemv_q4_inner(input, &weight.packed, &weight.scales, k, n, 0, k);
@@ -301,7 +304,7 @@ fn gemv_q4(input: &[f32], weight: &Q4Weight) -> Vec<f32> {
             let pp = packed_ptr; let pl = packed_len;
             let sp = scales_ptr; let sl = scales_len;
             let nn = n; let kk = k;
-            std::thread::spawn(move || {
+            crate::gpool::dispatch(move || {
                 let inp = unsafe { std::slice::from_raw_parts(ip as *const f32, il) };
                 let packed = unsafe { std::slice::from_raw_parts(pp as *const u8, pl) };
                 let scales = unsafe { std::slice::from_raw_parts(sp as *const f16, sl) };
@@ -312,7 +315,7 @@ fn gemv_q4(input: &[f32], weight: &Q4Weight) -> Vec<f32> {
 
     let mut output = vec![0.0f32; n];
     for h in handles {
-        let partial = h.join().unwrap();
+        let partial = h.recv().unwrap();
         for j in 0..n { output[j] += partial[j]; }
     }
     output

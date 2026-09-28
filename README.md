@@ -220,6 +220,23 @@ Per-phase rates on this machine:
 Rule of thumb: `Total ≈ 5s + frames × 2.2s (+ 8s ICL)`, with 1 frame = 80ms audio.
 Cap runaway runs with `--max-codes` (e.g. 100 ≈ 8s audio max).
 
+## Speedup notes (same machine, baseline: `--ref-audio voice/dpsng9.wav --text "你好初次见面我叫nori" --language chinese --seed 1790574344731051634`, 34 frames)
+
+`perf` showed 98% of generation cycles in scalar `gemv_q4_inner`; the code
+predictor's 15-step loop (≈1M-MAC GEMVs) ran single-threaded under the old 4M
+threading threshold.
+
+| Build | Generation | Total | vs baseline |
+|-------|-----------|-------|-------------|
+| generic release | 60.4s (1.78s/frame) | 77.4s | — |
+| `RUSTFLAGS="-C target-cpu=native"` | 56.0s | 73.6s | -5% total |
+| native + persistent GEMV thread pool | **41.0s (1.21s/frame)** | **58.1s** | **-25% total** |
+
+All three produce bit-identical audio for the same seed (verified by sha256).
+The pool (22 persistent workers, no per-call spawn) also lowered the threading
+threshold so predictor GEMVs parallelize. Remaining headroom: hand-written AVX2
+Q4 kernel (this CPU has no AVX-512, so the AVX-512 fast path never fires).
+
 ## Comparison with 0.6B
 
 | | QORA-TTS 1.7B | QORA-TTS 0.6B |
