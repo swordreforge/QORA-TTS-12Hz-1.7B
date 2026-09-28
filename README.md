@@ -53,8 +53,11 @@ qora-tts.exe --ref-audio voices/luna.wav --text "Short" --max-codes 100
 # Custom output path
 qora-tts.exe --ref-audio voices/sagar.wav --text "Hi there" --language english --output greeting.wav
 
-# Reproducible output with seed
+# Reproducible output with seed (the actual seed is printed each run when omitted)
 qora-tts.exe --ref-audio voices/luna.wav --text "Same every time" --seed 42
+
+# ICL mode: clone prosody too (needs reference transcript WITH punctuation)
+qora-tts.exe --ref-audio my_recording.wav --ref-text "Hello, how are you today?" --text "Custom voice" --language english
 ```
 
 ## Files
@@ -127,13 +130,22 @@ System: 16384 MB RAM (9856 MB free), 12 threads
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--text <text>` | "Hello, how are you today?" | Text to synthesize |
-| `--ref-audio <wav>` | - | **Required** - reference WAV for voice cloning |
+| `--ref-audio <wav>` | - | **Required** - reference WAV for voice cloning (24kHz mono, 3-10s clean speech) |
+| `--ref-text <text>` | - | Reference transcript → ICL mode: prosody (pauses/intonation/rate) follows the reference. **Must be accurate, punctuation included** |
+| `--encoder-weights <file>` | `<exe-dir>/speech_tokenizer/model.safetensors` | Codec encoder weights, only needed for ICL mode |
 | `--language <name>` | english | Target language |
 | `--output <path>` | output.wav | Output WAV path |
 | `--max-codes <n>` | 500 | Max code timesteps (~n/12.5 seconds) |
 | `--temperature <f>` | 0.8 | Sampling temperature |
 | `--top-k <n>` | 50 | Top-K sampling |
-| `--seed <n>` | random | Random seed for reproducibility |
+| `--seed <n>` | random | Random seed for reproducibility (printed each run) |
+
+### Clone modes
+
+| Mode | Flags | Copies timbre | Copies prosody |
+|------|-------|---------------|----------------|
+| x-vector only | `--ref-audio` | Yes | No (model default rhythm) |
+| ICL | `--ref-audio` + `--ref-text` | Yes | Yes (pauses/intonation follow reference) |
 
 ## Included Voices
 
