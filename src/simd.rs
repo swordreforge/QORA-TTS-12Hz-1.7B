@@ -408,7 +408,7 @@ unsafe fn causal_range_exact(
     causal_range_body!(
         input, weight, bias, in_ch, ksize, dilation,
         oc_start, oc_end, in_len, out_len, output,
-        (|acc: __m256, x: __m256, wb: __m256| _mm256_add_ps(acc, _mm256_mul_ps(x, wb)))
+        |acc: __m256, x: __m256, wb: __m256| _mm256_add_ps(acc, _mm256_mul_ps(x, wb))
     );
 }
 
@@ -430,7 +430,7 @@ unsafe fn causal_range_fma(
     causal_range_body!(
         input, weight, bias, in_ch, ksize, dilation,
         oc_start, oc_end, in_len, out_len, output,
-        (|acc: __m256, x: __m256, wb: __m256| _mm256_fmadd_ps(x, wb, acc))
+        |acc: __m256, x: __m256, wb: __m256| _mm256_fmadd_ps(x, wb, acc)
     );
 }
 

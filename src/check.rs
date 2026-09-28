@@ -38,7 +38,7 @@ fn need_file(dir: &Path, name: &str) -> CheckItem {
     let p = dir.join(name);
     match std::fs::metadata(&p) {
         Err(_) => CheckItem { name: name.into(), ok: false, detail: "missing".into() },
-        Ok(m) if is_lfs_pointer(&p) => CheckItem {
+        Ok(_) if is_lfs_pointer(&p) => CheckItem {
             name: name.into(),
             ok: false,
             detail: "git-lfs pointer, real file not downloaded (see README)".into(),

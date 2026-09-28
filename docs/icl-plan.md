@@ -134,7 +134,7 @@ RVQ `num_quantizers=32`、`encoder_valid_num_quantizers=16`、`num_semantic_quan
 
 - `model.qora-tts`：`VERSION + 1`（见 `src/save.rs`），尾部 append encoder 段。
 - `load` 必须兼容旧版：无 encoder 段 → ICL 报错但 x-vector 照常工作。
-- `compress_model`：新增 encoder 加载步骤；量化策略先 f32 保精度，Phase C 后视体积/速度
+- `compress-model`：新增 encoder 加载步骤；量化策略先 f32 保精度，Phase C 后视体积/速度
   再定是否 Q4（参考：现 talker Q4、speaker encoder f32）。
 
 ## 8. 风险与回退
