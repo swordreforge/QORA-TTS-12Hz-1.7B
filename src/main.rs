@@ -392,6 +392,10 @@ fn main() {
         eprintln!("--ref-text requires --ref-audio (ICL needs reference codes from audio)");
         std::process::exit(1);
     }
+    // Rule-based number normalization (Chinese only): ref_text must read the
+    // way the reference audio actually speaks the digits.
+    let ref_text: Option<String> =
+        ref_text.map(|rt| qora_tts::normalize::normalize_for_language(&rt, &language));
 
     // Load voice codes if --voice-codes provided
     let voice_codes = if let Some(ref vcp) = voice_codes_path {
@@ -471,6 +475,17 @@ fn main() {
     } else {
         vec![text.clone()]
     };
+    // Rule-based number normalization (Chinese only; other languages pass
+    // through). Applied after splitting so chunk boundaries stay stable.
+    // ref_text is normalized too: it must read the way the reference audio
+    // actually speaks the digits.
+    let chunks: Vec<String> = chunks
+        .into_iter()
+        .map(|c| qora_tts::normalize::normalize_for_language(&c, &language))
+        .collect();
+    if language.eq_ignore_ascii_case("chinese") {
+        eprintln!("Number normalization applied (chinese)");
+    }
     let mut audios: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
     for (idx, chunk_text) in chunks.iter().enumerate() {
         if chunks.len() > 1 {

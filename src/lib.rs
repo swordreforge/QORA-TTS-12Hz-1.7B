@@ -19,4 +19,5 @@ pub mod chunk;
 pub mod gpool;
 pub mod check;
 pub mod voice_profile;
+pub mod normalize;
 pub mod system;
