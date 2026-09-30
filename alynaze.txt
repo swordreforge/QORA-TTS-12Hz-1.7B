@@ -7,7 +7,8 @@
 > 3. **21s prefill / 2x decode 毛刺是环境的**：24 分钟长跑中的 CPU 争抢、E 核调度与散热墙，非算法问题。缓解靠 `taskset` + 安静机器；prefix-cache 落地后暴露面也随之消失。
 > 4. **Warmup 已经是链式的**（prev-chunk tail 12 帧，不是 ref），剩余 ~3% 要动 streaming decoder 重构，ROI 不足，已延期。"缓存 ref 中间状态"不要做。
 > 5. **量化状态已知**：talker Q4（1511MB/1.7B），手写 AVX2 核；本机无 AVX-512（运行时 dispatch，永不触发）。"检查 AVX-512/int8 GEMM"类建议跳过。
-> 6. **施工顺序**（有依赖）：① 前缀 KV 缓存（绝对位置已验证，精确复用，bit-identity 自证，约 -19%）→ ② 做完 ① 后**重算**合并短句的收益（长生成漂移与 per-frame 变慢是真实代价，合并目标取 `80~150 chars` 适中，不无脑合到 500）→ ③ allocator/LTO 先测量再要 → ④ iGPU/量化不出本次 scope。
+> 6. **施工顺序**（有依赖）：① 前缀 KV 缓存（已落地，-3%，见 8）→ ② 合并短句（已落地，默认 t80，-10%，见 9）→ ③ allocator/LTO 先测量再要（已测，见 10）→ ④ iGPU/量化不出本次 scope。
+> 10. **P1 allocator/LTO 已测（2026-09-30，two2 单块对照，输出 sha256 全程一致）**：thin→fat LTO 约 -5%（20.5s→19.3s，主要 prefill 7.2→6.7s），构建 46s，一行配置，**保留**；mimalloc 再 -0~1.5%（噪声级），且它是 C 代码（破 pure-Rust 立项），**已回退**。大 tensor 预分配：当前大头是逐帧/逐层 Vec 分配，但 allocator 实测无感，说明分配不是瓶颈，**不做**。
 > 8. **P0 前缀缓存已落地并纠正预期（2026-09-30 实测）**：① 只 cache 了 `9+R`（约 38/151，ICL 把本块文本揉进 block 前部，171 并非完全相同——原文"完全相同"有误）；② suffix-prefill 6.1s vs 全量 7.2s，prefill 是 overhead-dominated 非长度线性，**实测仅省 ~1.2s/块，长文档约 -3%**，不是 §2 预估的 -19%/250~350s。实现 bit-exact（同 seed 开/关 sha256 一致），默认开（`--no-prefix-cache` 回退）。真正的 P0 大头是**合并短 chunk**（每消灭一块省整个 8s prefill + decode）。
 > 9. **短块合并已落地（2026-09-30 实测，sub8 对照：8 句/687 帧同内容）**：unmerged 287s（RTF 5.24）→ merge-t120 275s（5.01，-4%）→ merge-t80 244s（4.72，**-10%**)。教训：decode 单帧成本随块长爬升（~86 帧 0.11s → ~215 帧 0.12s → ~340 帧 0.18s，疑似 Vocos 巨型 activation 的内存搬运），吃掉了 t120 大部分 prefill 红利；t80（~200 帧/块）是甜点。默认 `merge_target=80`，cap 150（帧估算 chars×2.8，实测 2.3~2.6+余量，500 码上限内安全；小 max-codes 自动缩 cap/禁用）。附带收益：接缝 38→~18（长文档），每个接缝都是一次 glitch 风险。`--merge-target N` / `--no-merge-chunks` 可调。待耳朵验收长块漂移。
 > 7. 术语：RTF 5.14x 即 0.19x realtime（RTF>1 = 慢于实时），全文统一按 RTF 表述。
