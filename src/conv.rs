@@ -196,10 +196,17 @@ fn causal_conv1d_range_scalar(
 ) {
     let causal_pad = (w.kernel_size - 1) * w.dilation;
     let ick = w.in_channels * w.kernel_size;
+    // Length tiling: mirrors the AVX2 macro (same tile geometry → same
+    // output bits; each element's full sum lives inside one o-iteration,
+    // so reordering positions is exact). Keeps the input window LLC-resident.
+    let tile = ((out_len.min(262144 / w.in_channels.max(1))).clamp(128, 16384)).max(1);
     for oc in oc_start..oc_end {
         let local_oc = oc - oc_start;
         let w_base = oc * ick;
-        for o in 0..out_len {
+        let mut ts = 0;
+        while ts < out_len {
+            let te = (ts + tile).min(out_len);
+            for o in ts..te {
             let mut sum = w.bias[oc];
             for ic in 0..w.in_channels {
                 let in_row = ic * in_len;
@@ -215,8 +222,10 @@ fn causal_conv1d_range_scalar(
                 }
             }
             output[local_oc * out_len + o] = sum;
+            }
+            ts = te;
+            }
         }
-    }
 }
 
 // ============================================================
@@ -599,6 +608,16 @@ mod tests {
         check_conv(8, 16, 7, 1, 100, 2); // vocos-init-like k=7
         check_conv(2, 2, 1, 1, 17, 3); // k=1, zero pad
         check_conv(16, 32, 3, 1, 200, 4); // wider
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_causal_tiled_large() {
+        // lengths past the tile size (tile=262144/ic): multi-tile runs and
+        // non-multiple tile edges must stay bit-identical across paths.
+        check_conv(4, 96, 7, 1, 3000, 21); // 2730+270 edge split
+        check_conv(2, 96, 7, 1, 20000, 22); // b3-like, 8 tiles
+        check_conv(4, 768, 3, 1, 2000, 23); // b0-like wide channels
     }
 
     #[test]

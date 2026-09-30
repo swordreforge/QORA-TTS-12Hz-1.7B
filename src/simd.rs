@@ -339,6 +339,17 @@ macro_rules! causal_range_body {
             let out_row = &mut $output[local_oc * $out_len..(local_oc + 1) * $out_len];
             out_row.fill($bias[oc]);
 
+            // Length tiling: keep one tile's input window
+            // (~tile*in_ch floats ≈ 1MB) LLC/L2-resident. The untiled code
+            // streams input rows strided by in_len (up to 1.8MB @462k),
+            // thrashing LLC on every (ic,k) pass. Tiling only reorders
+            // OUTPUT positions; per-lane (ic,k) accumulation is untouched,
+            // so this is bit-exact (scalar/vector split points may shift,
+            // but both paths do the same per-lane mul+add sequence).
+            let tile = (($out_len.min(262144 / $in_ch.max(1))).clamp(128, 16384)).max(1);
+            let mut ts = 0;
+            while ts < $out_len {
+                let te = (ts + tile).min($out_len);
             let w_base = oc * ick;
             for ic in 0..$in_ch {
                 let in_base = ic * $in_len;
@@ -351,7 +362,10 @@ macro_rules! causal_range_body {
                     if hi <= lo {
                         continue;
                     }
-                    let (lo, hi) = (lo as usize, hi as usize);
+                    let (lo, hi) = ((lo as usize).max(ts), (hi as usize).min(te));
+                    if hi <= lo {
+                        continue;
+                    }
                     let vs = (lo + 7) / 8 * 8;
                     let ve = hi / 8 * 8;
                     for o in lo..vs.min(hi) {
@@ -379,6 +393,8 @@ macro_rules! causal_range_body {
                         out_row[o] += $input[idx] * wk;
                     }
                 }
+            }
+                ts = te;
             }
         }
     }};
