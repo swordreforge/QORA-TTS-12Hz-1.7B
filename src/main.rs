@@ -32,7 +32,11 @@ fn main() {
     let mut save_voice_path: Option<PathBuf> = None;
     let mut decode_warmup = false;
     let mut warmup_frames: usize = 0;
-    let mut chain_frames: usize = 0;
+    // Chained warmup defaults ON (12 frames ≈ 1s of prev-chunk tail):
+    // validated onset fix at +~1.2s/chunk, cost independent of ref length.
+    // --chain-warmup [N] overrides length, --no-chain-warmup disables.
+    let mut chain_frames: usize = 12;
+    let mut chain_explicit = false;
     let mut check_target: Option<Option<PathBuf>> = None;
     let mut i = 1;
     while i < args.len() {
@@ -171,16 +175,17 @@ fn main() {
             "--chain-warmup" => {
                 // Optional length (frames, ~12.5/s). Default 12: measured
                 // minimum effective dose (4 ≈ no-op, 12 cleans the attack).
+                chain_explicit = true;
                 if i + 1 < args.len() {
                     if let Ok(n) = args[i + 1].parse::<usize>() {
                         chain_frames = n.max(1);
                         i += 1;
-                    } else {
-                        chain_frames = 12;
                     }
-                } else {
-                    chain_frames = 12;
                 }
+            }
+            "--no-chain-warmup" => {
+                chain_explicit = true;
+                chain_frames = 0;
             }
             "--save-voice" => {
                 if i + 1 < args.len() {
@@ -541,7 +546,7 @@ fn main() {
     // chunk's decode (same voice, freshest context, cost independent of ref
     // length). First chunk falls back to the ref/cold setting. Talker ICL is
     // unaffected (still uses ref_codes).
-    if chain_frames > 0 && chunks.len() < 2 {
+    if chain_explicit && chain_frames > 0 && chunks.len() < 2 {
         eprintln!("--chain-warmup needs at least 2 chunks, ignoring");
     }
     let mut prev_tail: Option<Vec<Vec<u32>>> = None;
