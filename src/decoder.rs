@@ -538,7 +538,7 @@ pub fn decode_to_audio(
                 signal[j] += residual[j];
             }
         }
-        eprintln!("  Vocos block {i}: [{out_ch}, {len}]");
+        eprintln!("  Vocos block {i}: [{out_ch}, {len}] in {:.1?}", s.elapsed());
         t_blk += s.elapsed();
     }
 
