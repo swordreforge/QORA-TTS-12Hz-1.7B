@@ -561,6 +561,65 @@ mod tests {
             .collect()
     }
 
+
+    /// Golden regression for transpose + depthwise (multi-tile shapes).
+    /// Values captured from the pre-tiling implementation; tiling must be
+    /// bit-exact (output-position reorder only, accumulation order kept).
+    #[test]
+    fn test_transpose_dw_golden() {
+        let mut st = 777u64;
+        let inp = rvec(&mut st, 192 * 3000, 1.0);
+        let w: Vec<f32> = rvec(&mut st, 192 * 96 * 4, 0.2);
+        let b: Vec<f32> = rvec(&mut st, 96, 0.1);
+        let tw = ConvTranspose1dWeight {
+            weight: w, bias: b, in_channels: 192, out_channels: 96,
+            kernel_size: 4, stride: 3, padding: 1,
+        };
+        let out_len = (3000 - 1) * 3 - 2 * 1 + 4;
+        let mut y = vec![0.0f32; 96 * out_len];
+        conv_transpose1d_range(&inp, &tw, 0, 96, 3000, out_len, &mut y);
+        assert!((y.iter().sum::<f32>() - 10309.475586).abs() < 1.0);
+        assert_eq!(y[0].to_bits(), 0.11413957f32.to_bits());
+        assert_eq!(y[12345].to_bits(), 0.30676275f32.to_bits());
+        assert_eq!(y[y.len() - 1].to_bits(), 0.7365111f32.to_bits());
+        // dense strided sweep: accumulation-order changes flip ulps
+        // somewhere in 864k outputs (the 3 samples above missed one
+        // during development); 64 points make golden sensitive.
+        {
+            let mut st2 = 777u64;
+            let inp0 = rvec(&mut st2, 192 * 3000, 1.0);
+            let w0: Vec<f32> = rvec(&mut st2, 192 * 96 * 4, 0.2);
+            let b0: Vec<f32> = rvec(&mut st2, 96, 0.1);
+            let tw0 = ConvTranspose1dWeight {
+                weight: w0, bias: b0, in_channels: 192, out_channels: 96,
+                kernel_size: 4, stride: 3, padding: 1,
+            };
+            let mut refy = vec![0.0f32; 96 * out_len];
+            // reference rebuilt with identical code path+seed: sanity that
+            // the sweep itself is deterministic (not a golden check yet)
+            conv_transpose1d_range(&inp0, &tw0, 0, 96, 3000, out_len, &mut refy);
+            assert_eq!(refy, y);
+            let step = y.len() / 64;
+            let mut acc: u64 = 0;
+            for (n, v) in y.iter().enumerate().step_by(step).take(64) {
+                acc = acc.wrapping_add((v.to_bits() as u64).wrapping_mul(n as u64 + 1));
+            }
+            assert_eq!(acc, 59818250823433361u64, "transpose sweep hash");
+        }
+        let inp2 = rvec(&mut st, 96 * 20000, 1.0);
+        let w2 = rvec(&mut st, 96 * 7, 0.2);
+        let b2 = rvec(&mut st, 96, 0.1);
+        let dw = DepthwiseConv1dWeight {
+            weight: w2, bias: b2, channels: 96, kernel_size: 7, padding: 6,
+        };
+        let mut y2 = vec![0.0f32; 96 * 20000];
+        dw_conv1d_range(&inp2, &dw, 0, 96, 20000, 20000, 6, &mut y2);
+        assert!((y2.iter().sum::<f32>() - -3754.235596).abs() < 1.0);
+        assert_eq!(y2[0].to_bits(), 0.030722003f32.to_bits());
+        assert_eq!(y2[765432].to_bits(), (-0.250796f32).to_bits());
+        assert_eq!(y2[y2.len() - 1].to_bits(), (-0.10229f32).to_bits());
+    }
+
     fn mkconv(state: &mut u64, oc: usize, ic: usize, k: usize, d: usize) -> Conv1dWeight {
         Conv1dWeight {
             weight: rvec(state, oc * ic * k, 0.5),
