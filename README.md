@@ -82,7 +82,10 @@ Japanese gets the same treatment with its own rules
 `2020年` → `ニセンニジュウネン`).
 reference transcripts (`--ref-text`) get the same treatment so text
 stays aligned with how the digits were spoken. Other languages pass
-through untouched.
+through untouched. English was evaluated by ear (decimals, model numbers,
+years, percents, currency, ordinals, time) and needs no module: the model
+reads digits acceptably and digit-by-digit fallback stays intelligible,
+unlike Chinese where a misreading changes the word.
 
 ## Files
 
