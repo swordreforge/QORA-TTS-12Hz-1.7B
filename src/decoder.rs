@@ -12,6 +12,7 @@
 //!   Output: SnakeBeta(96) → Conv1d(96→1, k=7) → clamp [-1,1]
 //!   Total upsample: 2×2×8×5×4×3 = 1920x → 12.5Hz × 1920 = 24kHz
 
+use std::time::Instant;
 use crate::conv::*;
 use crate::gemv::softmax_raw;
 
@@ -454,8 +455,11 @@ pub fn decode_to_audio(
             pre_conv_out[0*t1+3], pre_conv_out[0*t1+4]);
     }
 
-    // 3. Transformer → [1024, T]
+    // 3. Transformer → [1024, T] (single-threaded per-position GEMVs —
+    // see execution-graph notes; timed separately from Vocos below)
+    let s_tf = Instant::now();
     let tf_out = decoder_transformer(weights, &pre_conv_out);
+    let t_tf = s_tf.elapsed();
     let t2 = tf_out.len() / 1024;
     {
         let mn = tf_out.iter().copied().fold(f32::INFINITY, f32::min);
@@ -469,7 +473,9 @@ pub fn decode_to_audio(
 
     // 4. Upsample: 2× ConvT(s=2) + ConvNeXt → [1024, 4T]
     let mut signal = tf_out;
+    let mut t_up = std::time::Duration::ZERO;
     for (i, stage) in weights.upsample.iter().enumerate() {
+        let s = Instant::now();
         signal = conv_transpose1d(&signal, &stage.conv_t);
         // Causal right-crop: remove (kernel_size - stride) from right
         let right_crop = stage.conv_t.kernel_size - stage.conv_t.stride;
@@ -485,6 +491,7 @@ pub fn decode_to_audio(
             signal = cropped;
         }
         signal = convnext_forward(&signal, stage);
+        t_up += s.elapsed();
         let ch = stage.channels;
         let len = signal.len() / ch;
         eprintln!("  Upsample {i}: [{ch}, {len}]");
@@ -497,7 +504,9 @@ pub fn decode_to_audio(
     eprintln!("  Vocos init: [{vocos_ch}, {vocos_len}]");
 
     // 6. Vocos blocks
+    let mut t_blk = std::time::Duration::ZERO;
     for (i, vb) in weights.vocos_blocks.iter().enumerate() {
+        let s = Instant::now();
         let in_ch = vb.pre_snake_alpha.len();
 
         // SnakeBeta → ConvTranspose1d (causal: right-crop kernel_size - stride)
@@ -530,6 +539,7 @@ pub fn decode_to_audio(
             }
         }
         eprintln!("  Vocos block {i}: [{out_ch}, {len}]");
+        t_blk += s.elapsed();
     }
 
     // 7. Final SnakeBeta + output conv → [1, samples]
@@ -550,6 +560,8 @@ pub fn decode_to_audio(
     }
 
     eprintln!("  Audio: {} samples ({:.1}s at 24kHz)", signal.len(), signal.len() as f32 / 24000.0);
+    eprintln!("  Decode split: transformer {:.1?}, upsample {:.1?}, vocos-blocks {:.1?}, other {:.1?}",
+        t_tf, t_up, t_blk, s_tf.elapsed() - t_tf - t_up - t_blk);
     signal
 }
 
