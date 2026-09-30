@@ -142,10 +142,53 @@ pub fn load_profile(path: &Path) -> Result<VoiceProfile, String> {
     Ok(VoiceProfile { audio_len, audio_sha256: sha, ref_text, embedding, ref_codes })
 }
 
+/// Reuse plan for a loaded profile. Pure decision logic (unit-tested):
+/// - `audio_hash`: None = no --ref-audio given (trust mode, freshness
+///   unverified); Some(h) = verify against stored hash, mismatch → recompute.
+/// - `explicit_ref_text`: current --ref-text (already normalized).
+/// - effective text = explicit if given, else the profile's stored text.
+/// - codes reusable iff present AND stored text == effective text.
+pub struct ProfilePlan {
+    pub use_embedding: bool,
+    pub use_codes: bool,
+    pub effective_ref_text: Option<String>,
+}
+
+pub fn plan_profile_use(
+    profile: Option<&VoiceProfile>,
+    audio_hash: Option<[u8; 32]>,
+    explicit_ref_text: Option<&str>,
+) -> ProfilePlan {
+    let prof = match profile {
+        Some(p) => p,
+        None => {
+            return ProfilePlan {
+                use_embedding: false,
+                use_codes: false,
+                effective_ref_text: explicit_ref_text.map(|s| s.to_string()),
+            }
+        }
+    };
+    if let Some(h) = audio_hash {
+        if h != prof.audio_sha256 {
+            return ProfilePlan {
+                use_embedding: false,
+                use_codes: false,
+                effective_ref_text: explicit_ref_text.map(|s| s.to_string()),
+            };
+        }
+    }
+    let effective = explicit_ref_text
+        .map(|s| s.to_string())
+        .or_else(|| prof.ref_text.clone());
+    let codes_ok =
+        prof.ref_codes.is_some() && prof.ref_text.as_deref() == effective.as_deref();
+    ProfilePlan { use_embedding: true, use_codes: codes_ok, effective_ref_text: effective }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     fn sample_profile() -> VoiceProfile {
         VoiceProfile {
             audio_len: 12345,
@@ -212,5 +255,69 @@ mod tests {
     fn test_hash_stable_and_sensitive() {
         assert_eq!(hash_bytes(b"abc"), hash_bytes(b"abc"));
         assert_ne!(hash_bytes(b"abc"), hash_bytes(b"abd"));
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn prof() -> VoiceProfile {
+        VoiceProfile {
+            audio_len: 10,
+            audio_sha256: [9u8; 32],
+            ref_text: Some("ref text".into()),
+            embedding: vec![1.0, 2.0],
+            ref_codes: Some(vec![vec![1u32, 2]]),
+        }
+    }
+
+    #[test]
+    fn test_plan_no_profile() {
+        let p = plan_profile_use(None, Some([9u8; 32]), Some("x"));
+        assert!(!p.use_embedding && !p.use_codes);
+        assert_eq!(p.effective_ref_text, Some("x".into()));
+    }
+
+    #[test]
+    fn test_plan_hash_mismatch() {
+        let pr = prof();
+        let p = plan_profile_use(Some(&pr), Some([1u8; 32]), Some("ref text"));
+        assert!(!p.use_embedding && !p.use_codes);
+    }
+
+    #[test]
+    fn test_plan_full_hit_explicit_match() {
+        let pr = prof();
+        let p = plan_profile_use(Some(&pr), Some([9u8; 32]), Some("ref text"));
+        assert!(p.use_embedding && p.use_codes);
+        assert_eq!(p.effective_ref_text, Some("ref text".into()));
+    }
+
+    #[test]
+    fn test_plan_trust_mode_no_audio() {
+        // no audio hash: accept profile as-is, effective text from profile
+        let pr = prof();
+        let p = plan_profile_use(Some(&pr), None, None);
+        assert!(p.use_embedding && p.use_codes);
+        assert_eq!(p.effective_ref_text, Some("ref text".into()));
+    }
+
+    #[test]
+    fn test_plan_explicit_differs() {
+        // explicit ref_text wins; stored codes no longer match it
+        let pr = prof();
+        let p = plan_profile_use(Some(&pr), None, Some("other"));
+        assert!(p.use_embedding && !p.use_codes);
+        assert_eq!(p.effective_ref_text, Some("other".into()));
+    }
+
+    #[test]
+    fn test_plan_no_codes_in_profile() {
+        let mut pr = prof();
+        pr.ref_codes = None;
+        let p = plan_profile_use(Some(&pr), Some([9u8; 32]), None);
+        assert!(p.use_embedding && !p.use_codes);
+        assert_eq!(p.effective_ref_text, Some("ref text".into()));
     }
 }
