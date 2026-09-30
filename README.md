@@ -158,7 +158,7 @@ System: 16384 MB RAM (9856 MB free), 12 threads
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--text <text>` | "Hello, how are you today?" | Text to synthesize |
-| `--text-file <path>` | - | Long text file: auto-split into sentences, synthesized per chunk, joined with 30ms crossfade (deterministic per-chunk seeds when `--seed` given) |
+| `--text-file <path>` | - | Long text file: auto-split into sentences, short chunks merged (~80 chars, cap 150), synthesized per chunk, joined with 30ms crossfade (deterministic per-chunk seeds when `--seed` given). `--merge-target N` / `--no-merge-chunks` |
 | `--ref-audio <wav>` | - | **Required** - reference WAV for voice cloning (any sample rate: auto-resampled to 24kHz mono; 3-10s clean speech) |
 | `--ref-text <text>` | - | Reference transcript → ICL mode: prosody (pauses/intonation/rate) follows the reference. **Must be accurate, punctuation included** |
 | `--encoder-weights <file>` | `<exe-dir>/speech_tokenizer/model.safetensors` | Codec encoder weights, only needed for ICL mode |

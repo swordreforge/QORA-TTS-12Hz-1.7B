@@ -38,6 +38,13 @@ fn main() {
     let mut chain_frames: usize = 12;
     let mut chain_explicit = false;
     let mut no_prefix_cache = false;
+    // Short-chunk merging (P0 batch): greedy accumulate to ~80 chars,
+    // hard cap 150 (frame estimate ×2.8 keeps merged chunks < max_codes).
+    // Default 80 (not 120): measured decode cost climbs steeply past ~250
+    // frames/chunk (0.11 → 0.18 s/frame), so mid-size chunks net more than
+    // max-size ones (sub8: off 5.24 → t80 4.72 → t120 5.01 RTF).
+    let mut merge_target: usize = 80;
+    let mut no_merge_chunks = false;
     let mut check_target: Option<Option<PathBuf>> = None;
     let mut i = 1;
     while i < args.len() {
@@ -190,6 +197,15 @@ fn main() {
             }
             "--no-prefix-cache" => {
                 no_prefix_cache = true;
+            }
+            "--merge-target" => {
+                if i + 1 < args.len() {
+                    merge_target = args[i + 1].parse().unwrap_or(120);
+                    i += 1;
+                }
+            }
+            "--no-merge-chunks" => {
+                no_merge_chunks = true;
             }
             "--save-voice" => {
                 if i + 1 < args.len() {
@@ -544,6 +560,25 @@ fn main() {
         .collect();
     if language.eq_ignore_ascii_case("chinese") || language.eq_ignore_ascii_case("japanese") {
         eprintln!("Number normalization applied ({language})");
+    }
+    // P0 batch: merge short sentences so each chunk carries ~target chars.
+    // hard_max scales with max_codes (chars × 2.8 frame estimate + 40 headroom
+    // must fit); tiny max_codes (tests, debug) disables merging outright.
+    let mut chunks: Vec<String> = chunks;
+    if !no_merge_chunks && merge_target > 0 && chunks.len() > 1 {
+        let budget = max_codes.saturating_sub(40) as f32 / 2.8;
+        let hard_max = (budget as usize).min(150);
+        if hard_max < 40 {
+            eprintln!("Chunk merging skipped (max-codes {max_codes} too small)");
+        } else {
+            let before = chunks.len();
+            chunks = qora_tts::chunk::merge_short(chunks, merge_target, hard_max, max_codes);
+            if chunks.len() != before {
+                let avg = chunks.iter().map(|c| c.chars().count()).sum::<usize>() / chunks.len();
+                eprintln!("Merged {before} → {} chunks (target {merge_target}, cap {hard_max}, avg {avg} chars)",
+                    chunks.len());
+            }
+        }
     }
     let mut audios: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
     // Chained decoder warmup: tail codes of the previous chunk seed the next

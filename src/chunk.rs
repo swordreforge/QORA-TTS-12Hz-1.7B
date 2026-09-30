@@ -80,6 +80,72 @@ fn split_long(s: &str) -> Vec<String> {
     out
 }
 
+/// Greedy merge of short sentence chunks (P0 batch).
+/// Accumulate sentences until reaching `target` chars; flush early only when
+/// adding the next sentence would exceed `hard_max`. A trailing runt
+/// (<25 chars) folds into the previous chunk when the frame estimate
+/// (`chars × 2.8`, measured 2.3–2.6 + margin) still fits `max_codes`
+/// with 40 frames of headroom — otherwise it stays standalone.
+/// Joining restores the inter-sentence space for ASCII text (lost to trim()
+/// in split); CJK concatenates directly. `target == 0` disables (passthrough).
+pub fn merge_short(chunks: Vec<String>, target: usize, hard_max: usize, max_codes: usize) -> Vec<String> {
+    if chunks.len() < 2 || target == 0 {
+        return chunks;
+    }
+    let hard_max = hard_max.max(target).max(1);
+    let mut out: Vec<String> = Vec::with_capacity(chunks.len());
+    let mut cur = String::new();
+    let mut cur_len = 0usize;
+    for s in chunks {
+        let n = s.chars().count();
+        if cur.is_empty() {
+            cur = s;
+            cur_len = n;
+            continue;
+        }
+        if cur_len >= target || cur_len + n > hard_max {
+            out.push(std::mem::take(&mut cur));
+            cur = s;
+            cur_len = n;
+        } else {
+            join_sentence(&mut cur, &s);
+            cur_len += n;
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    // Trailing runt: folding one last 8s prefill away is worth it when safe.
+    if out.len() >= 2 {
+        let last_len = out.last().map(|s| s.chars().count()).unwrap_or(0);
+        if last_len < 25 {
+            let prev_len = out[out.len() - 2].chars().count();
+            let combined = prev_len + last_len + 1; // +1 for possible space
+            // frame estimate with margin: chars × 2.8 + 10 <= max_codes - 40
+            let est = combined * 14 / 5 + 10;
+            if est + 40 <= max_codes {
+                let last = out.pop().unwrap();
+                let prev = out.last_mut().unwrap();
+                join_sentence(prev, &last);
+            }
+        }
+    }
+    out
+}
+
+/// Append a sentence, restoring the space ASCII text needs (CJK: none).
+fn join_sentence(cur: &mut String, next: &str) {
+    let need_space = cur
+        .chars()
+        .last()
+        .map(|c| c.is_ascii())
+        .unwrap_or(false)
+        && next.chars().next().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false);
+    if need_space {
+        cur.push(' ');
+    }
+    cur.push_str(next);
+}
 /// Ensure at least `min_tail_secs` of trailing silence (digital zeros).
 /// Fixes hot-hot seams: a chunk ending in speech gets a clean stop + pause
 /// so the join crossfade blends silence into the next attack instead of
@@ -187,6 +253,67 @@ mod tests {
     fn test_split_no_punct() {
         let v = split_sentences("你好");
         assert_eq!(v, vec!["你好"]);
+    }
+
+    #[test]
+    fn test_merge_short_groups_to_target() {
+        // 47+45+15+26 = 133 >= 120 → flush; 42+43 = 85, +45 = 130 → flush
+        let v: Vec<String> = ["47xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "45xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "15xxxxxxxxxxxxx", "26xxxxxxxxxxxxxxxxxxxxxxxx",
+            "42xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "43xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "45xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]
+            .iter().map(|s| s.to_string()).collect();
+        let m = merge_short(v, 120, 150, 500);
+        assert_eq!(m.len(), 2);
+        assert!(m[0].chars().count() >= 120 && m[0].chars().count() <= 150);
+        assert!(m[1].chars().count() >= 120 - 45); // remainder absorbs rest
+    }
+
+    #[test]
+    fn test_merge_short_respects_hard_max() {
+        // 80+80: combined 160 > 150 → must NOT merge
+        let a = "x".repeat(80);
+        let m = merge_short(vec![a.clone(), a.clone()], 120, 150, 500);
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_short_ascii_space_restored() {
+        let m = merge_short(
+            vec!["Good morning!".into(), "How are you?".into()], 120, 150, 500);
+        assert_eq!(m, vec!["Good morning! How are you?"]);
+    }
+
+    #[test]
+    fn test_merge_short_cjk_no_space() {
+        let m = merge_short(
+            vec!["今天天气真好。".into(), "我们出去走走吧！".into()], 120, 150, 500);
+        assert_eq!(m, vec!["今天天气真好。我们出去走走吧！"]);
+    }
+
+    #[test]
+    fn test_merge_short_trailing_runt_folds() {
+        // 130-char head + 6-char runt → runt folds (est 300+10+40 <= 500)
+        let m = merge_short(vec!["x".repeat(130), "你好世界aa".into()], 120, 150, 500);
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_short_runt_kept_when_codes_tight() {
+        // same shape but max_codes=200: est 310+40 > 200 → runt stays
+        let m = merge_short(vec!["x".repeat(130), "你好世界aa".into()], 120, 150, 200);
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_short_passthrough() {
+        assert!(merge_short(vec![], 120, 150, 500).is_empty());
+        assert_eq!(merge_short(vec!["你好".into()], 120, 150, 500), vec!["你好"]);
+        // target 0 disables
+        let v = vec!["a".into(), "b".into()];
+        assert_eq!(merge_short(v.clone(), 0, 150, 500), v);
     }
 
     #[test]
