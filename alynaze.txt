@@ -1,0 +1,549 @@
+> **维护者注（2026-09-30，必读，后续 agent/开发者以此为准）**
+>
+> 本文件 CSV 与阶段耗时是实测资产，予以保留；但 §5 与 §2/§3 中的**归因和工具建议是黑盒推测**，以下逐条纠正，施工时不要按原文走：
+>
+> 1. **RAYON_NUM_THREADS / OMP / OpenBLAS 全部无效**：本仓库是纯 `std::thread` + 手写 AVX2 核（`src/simd.rs`、`src/gpool.rs`），没用任何并行运行时/BLAS。调线程的旋钮只有 `QORA_THREADS` 和 `taskset`（均已实测）。
+> 2. **Attention 不是热点**：perf 实测 98%+ 周期在 Q4 GEMV + 因果/转置卷积；这种序列长度下 FlashAttention、KV-int8 化收益为零。长块 per-frame 变慢（0.14→0.24）是事实，但归因"查 KV 实现"方向偏了。
+> 3. **21s prefill / 2x decode 毛刺是环境的**：24 分钟长跑中的 CPU 争抢、E 核调度与散热墙，非算法问题。缓解靠 `taskset` + 安静机器；prefix-cache 落地后暴露面也随之消失。
+> 4. **Warmup 已经是链式的**（prev-chunk tail 12 帧，不是 ref），剩余 ~3% 要动 streaming decoder 重构，ROI 不足，已延期。"缓存 ref 中间状态"不要做。
+> 5. **量化状态已知**：talker Q4（1511MB/1.7B），手写 AVX2 核；本机无 AVX-512（运行时 dispatch，永不触发）。"检查 AVX-512/int8 GEMM"类建议跳过。
+> 6. **施工顺序**（有依赖）：① 前缀 KV 缓存（绝对位置已验证，精确复用，bit-identity 自证，约 -19%）→ ② 做完 ① 后**重算**合并短句的收益（长生成漂移与 per-frame 变慢是真实代价，合并目标取 `80~150 chars` 适中，不无脑合到 500）→ ③ allocator/LTO 先测量再要 → ④ iGPU/量化不出本次 scope。
+> 7. 术语：RTF 5.14x 即 0.19x realtime（RTF>1 = 慢于实时），全文统一按 RTF 表述。
+>
+> ---
+>
+下面按 profiling 可用的粒度整理。你可以直接把 CSV 丢进 Excel / pandas 做图。
+
+## 1. 总览
+
+| 指标 | 数值 |
+|---|---:|
+| Chunk 数 | 39 |
+| 总音频时长 | 278.9 s |
+| 总耗时 | 1433.4 s ≈ 23.9 min |
+| 整体 RTF | 1433.4 / 278.9 ≈ 5.14x |
+| Prefill 总耗时 | 388.8 s，占 27.1% |
+| Talker Generation 总耗时 | 592.4 s，占 41.3% |
+| Speech Decode/Vocos 总耗时 | 450.8 s，占 31.5% |
+| 其他开销 | 约 1.4 s |
+| 模型加载 | 0.483 s / 1511 MB，可忽略 |
+
+---
+
+## 2. 逐 Chunk 关键日志 CSV
+
+列说明：  
+`chunk,chars,tokens,frames,prefill_s,gen_s,decode_s,total_s,audio_s`  
+`frames` 是 EOS 时的生成帧数。
+
+```csv
+chunk,chars,tokens,frames,prefill_s,gen_s,decode_s,total_s,audio_s
+1,47,25,105,7.9,16.6,19.3,43.9,8.4
+2,45,27,109,14.2,15.8,10.9,41.2,8.7
+3,16,13,35,8.2,5.0,4.2,17.4,2.8
+4,26,17,58,21.2,8.1,5.9,35.2,4.6
+5,43,32,103,8.0,15.3,10.6,34.0,8.2
+6,43,28,101,8.2,15.0,23.6,46.8,8.1
+7,45,35,93,8.1,13.6,9.4,31.1,7.4
+8,12,7,33,8.3,4.7,4.0,17.1,2.6
+9,34,23,78,21.0,11.0,7.7,39.8,6.2
+10,10,6,27,8.2,3.8,3.4,15.4,2.2
+11,46,30,88,8.2,25.6,8.8,42.6,7.0
+12,19,17,40,8.3,5.8,4.8,18.8,3.2
+13,27,22,54,21.0,7.5,5.5,34.1,4.3
+14,39,18,67,8.1,9.6,7.0,24.7,5.4
+15,55,39,111,8.3,16.4,11.4,36.1,8.9
+16,42,28,91,8.3,13.5,21.8,43.6,7.3
+17,47,40,101,8.1,14.8,10.3,33.3,8.1
+18,53,38,101,8.3,28.0,9.4,45.7,8.1
+19,61,50,114,8.1,16.9,11.8,36.8,9.1
+20,41,24,84,8.2,12.4,22.0,42.6,6.7
+21,50,36,89,7.9,12.9,9.2,30.1,7.1
+22,37,25,88,8.1,12.9,9.2,30.2,7.0
+23,13,9,33,8.3,4.7,4.1,17.1,2.6
+24,75,40,122,21.9,17.7,12.5,52.1,9.8
+25,79,52,160,8.1,37.1,16.8,62.1,12.8
+26,23,15,43,8.3,6.1,18.5,32.9,3.4
+27,75,38,134,7.5,19.8,13.9,41.1,10.7
+28,81,49,181,8.3,40.6,19.4,68.3,14.5
+29,6,4,21,8.3,2.9,3.1,14.4,1.7
+30,36,22,77,20.6,10.9,7.8,39.4,6.2
+31,55,31,103,8.2,15.1,10.6,34.0,8.2
+32,46,30,103,8.3,15.2,10.5,34.0,8.2
+33,97,59,186,8.3,42.5,20.1,70.9,14.9
+34,13,9,32,8.2,4.6,17.3,30.2,2.6
+35,46,28,104,7.7,15.1,10.5,33.3,8.3
+36,43,28,95,8.2,13.9,22.1,44.2,7.6
+37,47,31,91,8.0,13.2,9.3,30.5,7.3
+38,47,32,95,8.2,14.0,9.8,32.0,7.6
+39,64,43,139,8.2,33.8,14.3,56.4,11.1
+```
+
+---
+
+## 3. 异常点，profiling 重点看这些
+
+### 3.1 Prefill 异常慢
+
+正常 prefill 约 **7.5~8.3s**，但下面这些 chunk 到了 **20~22s**：
+
+| Chunk | Prefill | 正常值 | 倍数 |
+|---|---:|---:|---:|
+| 4 | 21.2s | ~8s | 2.6x |
+| 9 | 21.0s | ~8s | 2.6x |
+| 13 | 21.0s | ~8s | 2.6x |
+| 24 | 21.9s | ~8s | 2.7x |
+| 30 | 20.6s | ~8s | 2.5x |
+
+这些不是文本长度导致，文本都不长。更像：
+
+- CPU 线程池同步/争抢
+- 内存分配或 cache 逐出
+- 频率降频
+- 与上一块 decode 结束后的资源释放冲突
+
+建议 profiling 时单独抓这几个 chunk 的 `perf`。
+
+---
+
+### 3.2 Decode 异常慢
+
+正常 decode 约 **0.09~0.10s/timestep**，但下面这些明显异常：
+
+| Chunk | Decode 总耗时 | Decoding timesteps | 估算 s/timestep | 备注 |
+|---|---:|---:|---:|---|
+| 6 | 23.6s | 113 | 0.209 | 约 2x |
+| 16 | 21.8s | 103 | 0.212 | 约 2x |
+| 20 | 22.0s | 96 | 0.229 | 约 2.3x |
+| 26 | 18.5s | 55 | 0.336 | 短块但极慢 |
+| 34 | 17.3s | 44 | 0.393 | 短块但极慢 |
+| 36 | 22.1s | 107 | 0.207 | 约 2x |
+
+这些块生成帧数不多，但 decode 时间很高。重点查：
+
+- Vocos 大张量分配/释放
+- 卷积内核线程数
+- 内存带宽
+- 是否有后台任务或调度抖动
+
+---
+
+### 3.3 长 Chunk 的 Talker 生成变慢
+
+长 chunk 的每帧耗时明显上升：
+
+| Chunk | Frames | Gen 耗时 | s/frame |
+|---|---:|---:|---:|
+| 25 | 160 | 37.1s | 0.232 |
+| 28 | 181 | 40.6s | 0.224 |
+| 33 | 186 | 42.5s | 0.228 |
+| 39 | 139 | 33.8s | 0.243 |
+| 29 | 21 | 2.9s | 0.138 |
+| 10 | 27 | 3.8s | 0.141 |
+
+说明自回归上下文变长后，attention/KV cache 成本上升。可以查 KV cache 实现、attention 内核、是否每次重新计算。
+
+---
+
+### 3.4 短 Chunk 固定开销过高
+
+| Chunk | 字符数 | 音频 | 总耗时 | RTF |
+|---|---:|---:|---:|---:|
+| 29 | 6 | 1.7s | 14.4s | 8.47 |
+| 10 | 10 | 2.2s | 15.4s | 7.00 |
+| 8 | 12 | 2.6s | 17.1s | 6.58 |
+| 23 | 13 | 2.6s | 17.1s | 6.58 |
+| 34 | 13 | 2.6s | 30.2s | 11.62 |
+
+短块被固定 prefill + decoder warmup + EOS 开销拖死。合并 chunk 收益会很大。
+
+---
+
+## 4. 每个 Chunk 重复的固定日志
+
+这些行几乎每块都一样，是最大浪费来源：
+
+```text
+ICL mode: ref_text 35 tokens, ref_codes 16x161, block 162, remainder 0
+Voice embedding norm=17.1930, injected with TTS_PAD overlay at position 4
+Prefill done in X, position=171
+```
+
+说明每块都重新 prefill 到 **position=171**，参考前缀完全相同。
+
+从 Chunk 2 开始还有：
+
+```text
+Decoder warmup: chained 12 frames (prev chunk tail)
+Decoder warmup: 12 ref frames prepended
+Decoder warmup trimmed: 23040 samples (12/N frames)
+```
+
+每块额外解码 12 帧再裁掉。39 块累计多出约 **456 个 decode timestep**，按 0.1s/timestep 估算浪费 **45~60s**。
+
+---
+
+## 5. 建议的 profiling 命令
+
+抓关键行：
+
+```bash
+grep -E "--- Chunk|Prefill done|Generating frame|Generation done|Decoding|Audio:|Decode done|Total:" run.log > prof.log
+```
+
+用 perf 抓热点：
+
+```bash
+perf record -g -- target/release/qora-tts ... 
+perf report
+```
+
+Rust 火焰图：
+
+```bash
+cargo install flamegraph
+cargo flamegraph --release --bin qora-tts -- ...
+```
+
+线程数对比：
+
+```bash
+RAYON_NUM_THREADS=8  target/release/qora-tts ...
+RAYON_NUM_THREADS=12 target/release/qora-tts ...
+RAYON_NUM_THREADS=16 target/release/qora-tts ...
+```
+
+绑核测试：
+
+```bash
+taskset -c 0-15 target/release/qora-tts ...
+```
+
+内存分配观察：
+
+```bash
+/usr/bin/time -v target/release/qora-tts ...
+```
+
+---
+
+## 6. 一句话结论
+
+Profiling 优先盯三块：
+
+1. **每块重复 prefill 到 position=171**：正常 8s × 39 ≈ 312s，异常块到 21s，总 prefill 388.8s。
+2. **每块 decoder warmup 12 帧再裁掉**：约浪费 50~60s。
+3. **短 chunk 太多 + 长 chunk attention 变慢**：短块 RTF 可到 8~11，长块每帧耗时从 0.14s 涨到 0.24s。
+
+最大优化点仍然是：**缓存 ICL/voice 前缀 KV cache、合并短 chunk、复用 decoder warmup。**
+整体看，这次不是“模型加载慢”，而是 **39 个 chunk 串行推理 + 每个 chunk 都重复做大量固定工作** 导致的。日志里集成显卡没有参与计算，完全是 CPU 路径。按日志粗算：
+
+- 39 个 chunk，总输出音频约 **278.9s**
+- 推理总耗时约 **1433s ≈ 23.9 分钟**
+- 实时率 RTF ≈ **1433 / 278.9 ≈ 5.14x**，即生成 1 秒音频要 5 秒多
+- 模型加载只有 **0.483s / 1511MB**，不是瓶颈
+- 阶段占比大致：
+  - Prefill：**388.8s，27.1%**
+  - Talker generation：**592.4s，41.3%**
+  - Speech decode/Vocos：**450.8s，31.5%**
+
+核心结论：**最大优化点是复用每个 chunk 完全相同的 ICL/voice 前缀，其次减少 chunk 数、复用 decoder warmup、调线程和量化内核。iGPU 最适合接 Speech decoder/Vocos。**
+
+---
+
+## 1. 关键日志现象
+
+每个 chunk 都有：
+
+```text
+ICL mode: ref_text 35 tokens, ref_codes 16x161, block 162, remainder 0
+Voice embedding norm=17.1930, injected with TTS_PAD overlay at position 4
+Prefill done in 8.x s, position=171
+```
+
+也就是说：
+
+- 参考文本 35 tokens
+- 参考 codes 16x161，block 162
+- voice embedding 每次都相同，norm=17.1930
+- 每个 chunk 都重新 prefill 到 position=171
+
+但 39 个 chunk 的参考前缀完全相同。现在每块都重新算一遍，这是巨大浪费。
+
+Prefill 大多数是 **8.1~8.3s**，但有些异常到 **20~22s**：
+
+- Chunk 4：21.2s
+- Chunk 9：21.0s
+- Chunk 13：21.0s
+- Chunk 24：21.9s
+- Chunk 30：20.6s
+
+这些异常不是文本长度导致的，更像 CPU 调度、频率、内存分配、线程池同步或缓存逐出问题。
+
+Generation 总 592.4s，平均每帧约 **0.17s/frame**。长 chunk 明显更慢：
+
+- 33 帧：4.7s ≈ 0.142s/frame
+- 186 帧：42.5s ≈ 0.228s/frame
+- 181 帧：40.6s ≈ 0.224s/frame
+- 160 帧：37.1s ≈ 0.232s/frame
+
+说明自回归上下文变长后，attention/KV cache 成本上升。
+
+Decode 总 450.8s，正常约 **0.09~0.10s/timestep**，但异常块会到 **0.2~0.39s/timestep**。并且每个 chunk 从第 2 块开始都有：
+
+```text
+Decoder warmup: chained 12 frames
+Decoder warmup: 12 ref frames prepended
+Decoder warmup trimmed: 23040 samples
+```
+
+这相当于每块多解码 12 帧再裁掉。39 块累计多出约 456 个 decode timestep，占总 decode timestep 约 11.6%，大约浪费 **50~60s**。
+
+---
+
+## 2. 优化优先级
+
+### P0：缓存/复用 ICL prefix，收益最大
+
+现在每块 prefill 固定 171 位置，参考文本、参考 codes、voice embedding 完全一样。理想情况下：
+
+- 进程启动后只计算一次 ref_text + ref_codes + voice embedding 的 talker KV cache
+- 每个 chunk 只 prefill 新文本 token
+- 从 position=171 继续生成
+
+预计效果：
+
+- 每块 prefill 从 8s 降到 1~2s 甚至更低
+- 39 块可省 **250~350s**
+- 总时间直接下降 20% 以上
+
+实现要点：
+
+- 保存 talker 前 171 位置的 K/V cache
+- 保持位置编码正确，新文本从 171 开始
+- 如果 Rust 代码里 KV cache 是每块新建，需要改成可复用对象
+- 如果 voice profile 每块重新注入，也可以缓存 embedding 和注入后的 prefix
+
+这是最值得做的优化。
+
+---
+
+### P0：减少 chunk 数，合并短句
+
+现在 result.txt 被切成 39 chunks，很多非常短：
+
+- 6 chars、10 chars、12 chars、13 chars、16 chars、19 chars 等
+- Chunk 29 只有 6 chars，总耗时 14.4s，音频 1.7s，RTF 约 8.5
+
+每个 chunk 的固定成本包括：
+
+- prefill 约 8s
+- decoder warmup 12 帧
+- EOS 生成、调度、分配、保存
+
+建议：
+
+- 按语义合并短句，尽量接近 max codes 500 或模型上下文上限
+- 保持每块 100~200 帧以上，减少固定开销
+- 如果质量允许，39 chunks 合并到 10~15 chunks，能省大量 prefill 和 warmup
+
+预计收益：**100~300s**，实现成本低。
+
+---
+
+### P1：去掉或复用 decoder warmup
+
+日志里每块都：
+
+```text
+Decoder warmup: chained 12 frames
+Decoder warmup: 12 ref frames prepended
+Decoder warmup trimmed: 23040 samples
+```
+
+每块额外解码 12 帧，再裁掉。可以尝试：
+
+- 第一块之后不再 prepend ref 12 帧，直接用前一块尾部状态
+- 缓存 ref 帧的 pre-conv / transformer / Vocos 中间状态
+- 如果 decoder 是卷积结构，保留波形上下文，而不是重新解码再裁剪
+
+预计节省 decode 时间 **10~15%**，约 **50~60s**。
+
+---
+
+### P1：线程和 CPU 调优
+
+日志显示：
+
+```text
+System: 31570 MB RAM, 22 threads
+```
+
+22 threads 很可能是逻辑核数，包含超线程。纯 CPU 矩阵乘/卷积不一定线程越多越好，线程同步和内存带宽会拖累。
+
+建议测试：
+
+```bash
+RAYON_NUM_THREADS=8
+RAYON_NUM_THREADS=12
+RAYON_NUM_THREADS=16
+OMP_NUM_THREADS=...
+OPENBLAS_NUM_THREADS=...
+```
+
+并用 `taskset` 绑定物理核：
+
+```bash
+taskset -c 0-15 target/release/qora-tts ...
+```
+
+同时：
+
+- 电源模式设为 performance
+- 关闭后台任务
+- 如果多 NUMA，用 `numactl --interleave=all`
+- 用 `perf stat -d` 看 IPC、缓存未命中、内存带宽
+- 用 `cargo flamegraph` 看热点是 attention、GEMM 还是 Vocos 卷积
+
+预计收益：**10~30%**，尤其能缓解那些 20s prefill 和 20s decode 的异常块。
+
+---
+
+### P1：编译与内存分配优化
+
+你已经用了：
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo run --release
+```
+
+可以再加：
+
+```bash
+RUSTFLAGS="-C target-cpu=native -C opt-level=3 -C lto=fat -C codegen-units=1"
+```
+
+如果项目允许，使用：
+
+- `mimalloc` 或 `jemalloc`
+- 预分配/复用大 tensor 缓冲区
+- 避免每块重新分配 `[512, T]`、`[1024, T]`、`[1536, T]`、`[96, 289920]` 这类大张量
+- 使用内存池或 arena
+
+日志里 Vocos block 3 出现：
+
+```text
+Vocos block 3: [96, 289920]
+```
+
+这种大张量频繁分配/释放会明显增加延迟，尤其异常 decode 块。
+
+---
+
+### P2：量化与内核优化
+
+模型权重加载 1511MB，对 1.7B 参数约 0.89 B/参数，看起来已经是 int8 或混合量化。继续量化的空间不一定大，但可以检查：
+
+- 是否启用 AVX2 / AVX-512 / VNNI / BF16
+- 是否使用 int8 GEMM
+- attention 是否有 FlashAttention 类似优化
+- KV cache 是否可 int8 量化
+- Vocos 卷积是否用 oneDNN / OpenBLAS / 自研 SIMD
+
+如果是纯 Rust 自研内核，优先优化：
+
+- GEMM
+- attention
+- 卷积
+- 内存拷贝
+
+预计收益：**20~40%**，取决于当前内核质量。
+
+---
+
+### P2：iGPU 加速 Speech decoder / Vocos
+
+日志完全没有 GPU 调用，集成显卡没参与。最适合放 iGPU 的是：
+
+- VQ codebook lookup
+- pre-conv
+- speech decoder 8 层 transformer
+- Vocos 上采样和卷积
+
+原因：
+
+- 这些是规则卷积/矩阵运算，并行度高
+- 不依赖自回归逐帧采样
+- Vocos 输出张量很大，GPU 更合适
+
+可选路线：
+
+- Vulkan / wgpu 实现 Vocos 前向
+- OpenCL / oneAPI / OpenVINO
+- ONNX Runtime + OpenVINO EP
+- 把 speech decoder 单独导出成 ONNX，用 iGPU 跑
+
+注意：iGPU 共享内存带宽，如果同时 CPU 跑 talker，可能竞争内存。建议：
+
+- talker 留 CPU
+- decode/Vocos 放 iGPU
+- 或者流水线：CPU 生成下一块，iGPU 解码当前块
+
+预计 decode 可从 450s 降到 100~200s，但移植成本较高。
+
+---
+
+### P2：生成与解码流水线
+
+当前是串行：
+
+```text
+prefill -> generate -> decode -> 下一块 prefill -> ...
+```
+
+可以尝试：
+
+- 当前 chunk 在 decode 时，下一 chunk 做 prefill
+- 当前 chunk 在 decode 时，下一 chunk 做 talker generation
+- 但纯 CPU 下会争抢核心，需要实验线程分配
+
+如果 decode 放 iGPU，流水线收益会很大。
+
+---
+
+## 3. 建议的优化顺序
+
+1. **缓存 ICL prefix / voice embedding / ref codes 的 KV cache**
+2. **合并短 chunk，减少 chunk 数**
+3. **复用 decoder warmup，去掉每块 12 ref frames 重复解码**
+4. **线程数调优：8/12/16 物理核测试，绑定核心**
+5. **预分配/复用大 tensor，换 mimalloc**
+6. **加 LTO、PGO、检查 AVX-512/VNNI**
+7. **把 Vocos/speech decoder 放 iGPU 或 OpenVINO**
+8. **模型层面：减少 talker 层、蒸馏、更小 vocoder**
+
+---
+
+## 4. 预期效果
+
+如果只做 P0：
+
+- 缓存 ICL prefix
+- 合并 chunk
+- 复用 warmup
+
+可能从 **24 分钟降到 12~15 分钟**，RTF 从 5.1 降到 2.5~3.0。
+
+如果再加上：
+
+- 线程调优
+- 量化内核优化
+- iGPU 跑 Vocos
+
+有机会降到 **8~12 分钟**，RTF 接近 2 左右。
+
+当前最大瓶颈不是模型加载，也不是编译，而是：
+
+> **每块重复 prefill 171 位置 + 每块重复 decoder warmup + 39 个 chunk 串行执行。**
+
+优先解决这三个，收益最直接。
