@@ -391,16 +391,54 @@ fn convnext_forward(input: &[f32], stage: &UpsampleStage) -> Vec<f32> {
 /// Decode audio codes to waveform.
 /// codes: [16][T] — 16 codebook indices per timestep.
 /// Returns: f32 audio samples at 24kHz.
-pub fn decode_to_audio(weights: &SpeechDecoderWeights, codes: &[Vec<u32>]) -> Vec<f32> {
+///
+/// `warmup`: optional reference codes [16][Tv] prepended before decoding
+/// (official ICL parity: the decoder must not start cold — conv state and
+/// sliding-window attention need left context, otherwise chunk attacks
+/// render in the wrong voice). The reference portion is trimmed afterwards
+/// with the official proportional cut: `Tv / (Tv + T) * len(samples)`.
+pub fn decode_to_audio(
+    weights: &SpeechDecoderWeights,
+    codes: &[Vec<u32>],
+    warmup: Option<&[Vec<u32>]>,
+) -> Vec<f32> {
     let t = codes[0].len();
     if t == 0 {
         eprintln!("  No audio codes to decode!");
         return Vec::new();
     }
+
+    // Official ICL parity: prepend ref codes so the decoder starts warm.
+    // trim = (Tv, Tv + T); cut = Tv / (Tv + T) * samples at the end.
+    let full: Vec<Vec<u32>>;
+    let (work, trim): (&[Vec<u32>], Option<(usize, usize)>) = match warmup {
+        Some(w)
+            if w.len() == codes.len()
+                && !w.is_empty()
+                && w.iter().all(|q| q.len() == w[0].len())
+                && !w[0].is_empty() =>
+        {
+            let tv = w[0].len();
+            eprintln!("  Decoder warmup: {tv} ref frames prepended");
+            full = w
+                .iter()
+                .zip(codes.iter())
+                .map(|(a, b)| {
+                    let mut v = Vec::with_capacity(a.len() + b.len());
+                    v.extend_from_slice(a);
+                    v.extend_from_slice(b);
+                    v
+                })
+                .collect();
+            (&full, Some((tv, tv + t)))
+        }
+        _ => (codes, None),
+    };
+    let t = work[0].len();
     eprintln!("  Decoding {t} timesteps to audio...");
 
     // 1. Codebook lookup → [512, T]
-    let vq_out = codebook_lookup(weights, codes);
+    let vq_out = codebook_lookup(weights, work);
     eprintln!("  Codebook lookup: [512, {t}]");
 
     // 2. Pre-conv: CausalConv1d(512→1024, k=3) → [1024, T]
@@ -504,6 +542,13 @@ pub fn decode_to_audio(weights: &SpeechDecoderWeights, codes: &[Vec<u32>]) -> Ve
         *s = s.clamp(-1.0, 1.0);
     }
 
+    // Official ICL parity: trim the prepended reference portion.
+    if let Some((tv, total)) = trim {
+        let cut = warmup_trim_len(tv, total, signal.len());
+        eprintln!("  Decoder warmup trimmed: {cut} samples ({tv}/{total} frames)");
+        signal.drain(..cut);
+    }
+
     eprintln!("  Audio: {} samples ({:.1}s at 24kHz)", signal.len(), signal.len() as f32 / 24000.0);
     signal
 }
@@ -576,6 +621,14 @@ fn apply_rope_split_half(
     }
 }
 
+/// Official proportional cut for warmed decode output:
+/// `Tv / (Tv + T) * samples`. Pure helper so the arithmetic is unit-tested.
+pub fn warmup_trim_len(tv_frames: usize, total_frames: usize, out_len: usize) -> usize {
+    if total_frames == 0 {
+        return 0;
+    }
+    (tv_frames * out_len / total_frames).min(out_len)
+}
 /// LayerNorm applied per-timestep across channels (channel-first format).
 fn layer_norm_channel_first(
     input: &[f32], gamma: &[f32], beta: &[f32], channels: usize, eps: f32,
@@ -599,4 +652,20 @@ fn layer_norm_channel_first(
         }
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_warmup_trim_len() {
+        // 141 ref + 34 gen frames, 175*1920 samples: cut == 141*1920 exactly
+        assert_eq!(warmup_trim_len(141, 175, 175 * 1920), 141 * 1920);
+        // rounding down + clamp
+        assert_eq!(warmup_trim_len(1, 3, 100), 33);
+        assert_eq!(warmup_trim_len(0, 10, 100), 0);
+        assert_eq!(warmup_trim_len(5, 0, 100), 0);
+        assert_eq!(warmup_trim_len(10, 10, 50), 50);
+    }
 }

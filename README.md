@@ -264,7 +264,8 @@ threading threshold.
 | native + pool + hand-written AVX2 Q4 kernel | 25.9s (0.76s/frame) | 42.1s | -46% total |
 | + AVX2 causal-conv kernel (decode) | 25.7s | 32.7s (decode 13.8s → 4.2s) | -58% total |
 | + GEMV overdecomposition (4x chunks) | 19.1s (0.56s/frame) | 25.6s | -67% total |
-| + integer-arithmetic Q4 LUT | **12.0s (0.35s/frame)** | **17.7s** | **-77% total** |
+| + integer-arithmetic Q4 LUT | 12.0s (0.35s/frame) | 17.7s | -77% total |
+| + ICL decoder warmup (ref prepend) | same | decode ×~2.5 in ICL mode (official parity; fixes cold-start attacks) | quality fix, costs time |
 
 Bit-identical chain: the first five builds produce identical audio for the same
 seed. Overdecomposition changed FP summation order, so bit-identity is no

@@ -464,7 +464,7 @@ pub fn generate_speech(
 
     // Decode to audio
     let t_decode = Instant::now();
-    let audio = crate::decoder::decode_to_audio(decoder, &all_codes);
+    let audio = crate::decoder::decode_to_audio(decoder, &all_codes, ref_codes.as_deref());
     eprintln!("Decode done in {:.1?}", t_decode.elapsed());
 
     eprintln!("Total: {:.1?}", t0.elapsed());

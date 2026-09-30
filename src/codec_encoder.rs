@@ -935,7 +935,7 @@ mod tests {
         let codes = encode_waveform_to_codes(&w, &audio);
         let (_talker, _predictor, decoder, _) =
             crate::save::load_model(std::path::Path::new(&model_path)).expect("model load");
-        let out = crate::decoder::decode_to_audio(&decoder, &codes);
+        let out = crate::decoder::decode_to_audio(&decoder, &codes, None);
         let expect_len = codes[0].len() * 1920;
         assert_eq!(out.len(), expect_len, "decoded length");
         assert!(out.iter().all(|v| v.is_finite()), "finite output");

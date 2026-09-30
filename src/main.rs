@@ -277,7 +277,7 @@ fn main() {
         eprintln!("Decode-only mode: loading codes from {}...", dcp.display());
         let all_codes = load_all_voice_codes(dcp);
         let t_decode = Instant::now();
-        let audio = qora_tts::decoder::decode_to_audio(&decoder, &all_codes);
+        let audio = qora_tts::decoder::decode_to_audio(&decoder, &all_codes, None);
         eprintln!("Audio decoded in {:.1?}", t_decode.elapsed());
         qora_tts::wav::write_wav(&output_path, &audio, 24000).expect("Failed to write WAV");
         eprintln!("Saved to {}", output_path.display());
