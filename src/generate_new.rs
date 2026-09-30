@@ -48,6 +48,10 @@ pub struct TTSParams {
     /// and collect most roughness defects). 0 = off.
     pub onset_frames: usize,
     pub onset_temperature: f32,
+    /// ICL decoder warmup: prepend ref codes so conv state and sliding-window
+    /// attention start warm (official parity; fixes cold-start attacks).
+    /// Costs decode time ∝ ref length. false = fast cold path (default).
+    pub decode_warmup: bool,
 }
 
 impl Default for TTSParams {
@@ -62,6 +66,7 @@ impl Default for TTSParams {
             codec_bos_id: CODEC_BOS,
             onset_frames: 0,
             onset_temperature: 0.3,
+            decode_warmup: false,
         }
     }
 }
@@ -464,7 +469,11 @@ pub fn generate_speech(
 
     // Decode to audio
     let t_decode = Instant::now();
-    let audio = crate::decoder::decode_to_audio(decoder, &all_codes, ref_codes.as_deref());
+    let audio = crate::decoder::decode_to_audio(
+        decoder,
+        &all_codes,
+        if params.decode_warmup { ref_codes.as_deref() } else { None },
+    );
     eprintln!("Decode done in {:.1?}", t_decode.elapsed());
 
     eprintln!("Total: {:.1?}", t0.elapsed());
@@ -645,6 +654,7 @@ mod tests {
             codec_bos_id: CODEC_BOS,
             onset_frames: 0,
             onset_temperature: 0.3,
+            decode_warmup: false,
         }
     }
 

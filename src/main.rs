@@ -30,6 +30,7 @@ fn main() {
     let mut text_file: Option<PathBuf> = None;
     let mut load_voice_path: Option<PathBuf> = None;
     let mut save_voice_path: Option<PathBuf> = None;
+    let mut decode_warmup = false;
     let mut check_target: Option<Option<PathBuf>> = None;
     let mut i = 1;
     while i < args.len() {
@@ -154,6 +155,9 @@ fn main() {
                     load_voice_path = Some(PathBuf::from(&args[i + 1]));
                     i += 1;
                 }
+            }
+            "--decode-warmup" => {
+                decode_warmup = true;
             }
             "--save-voice" => {
                 if i + 1 < args.len() {
@@ -508,6 +512,7 @@ fn main() {
                 codec_bos_id: 2149,
                 onset_frames,
                 onset_temperature,
+                decode_warmup,
             },
             chunk_seed,
             ref_text_tokens.clone(),
