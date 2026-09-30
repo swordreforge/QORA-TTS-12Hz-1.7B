@@ -194,6 +194,166 @@ pub fn build_icl_block(
     (icl, remainder)
 }
 
+/// The 6 dual-stream codec header positions shared by every chunk
+/// (voice-cloning path: 4 codec+PAD, voice+PAD at pos 4, PAD+BOS).
+/// Chunk-independent: same voice + language → identical vectors.
+fn build_codec_prefix_voice(talker: &TalkerWeights, language_id: u32, voice_embedding: &[f32]) -> Vec<Vec<f32>> {
+    let hidden_size = talker.hidden_size;
+    let mut out = Vec::with_capacity(6);
+    let prefix_codec = [CODEC_THINK, CODEC_THINK_BOS, language_id, CODEC_THINK_EOS];
+    let tts_pad_proj = crate::talker::embed_text_token(talker, TTS_PAD);
+    let tts_bos_proj = crate::talker::embed_text_token(talker, TTS_BOS);
+    for &tok in &prefix_codec {
+        let codec_emb = crate::talker::embed_codec_token(talker, tok);
+        let mut combined = vec![0.0f32; hidden_size];
+        for j in 0..hidden_size {
+            combined[j] = codec_emb[j] + tts_pad_proj[j];
+        }
+        out.push(combined);
+    }
+    let mut pos4 = vec![0.0f32; hidden_size];
+    for j in 0..hidden_size.min(voice_embedding.len()) {
+        pos4[j] = voice_embedding[j] + tts_pad_proj[j];
+    }
+    out.push(pos4);
+    let pad_emb = crate::talker::embed_codec_token(talker, CODEC_PAD);
+    let mut pad_combined = vec![0.0f32; hidden_size];
+    for j in 0..hidden_size {
+        pad_combined[j] = pad_emb[j] + tts_bos_proj[j];
+    }
+    out.push(pad_combined);
+    out
+}
+
+/// Built-in speaker variant of the 6 header positions (no voice embedding).
+fn build_codec_prefix_builtin(talker: &TalkerWeights, speaker_id: u32, language_id: u32) -> Vec<Vec<f32>> {
+    let hidden_size = talker.hidden_size;
+    let codec_tokens = [CODEC_THINK, CODEC_THINK_BOS, language_id, CODEC_THINK_EOS, speaker_id, CODEC_PAD];
+    let mut codec_embeds: Vec<Vec<f32>> = codec_tokens.iter()
+        .map(|&t| crate::talker::embed_codec_token(talker, t))
+        .collect();
+    let tts_overlay = build_tts_pad_bos(talker, 5);
+    for i in 0..6 {
+        for j in 0..hidden_size {
+            codec_embeds[i][j] += tts_overlay[i][j];
+        }
+    }
+    codec_embeds
+}
+
+/// Chunk-independent head of the prefill sequence: role (3) + codec header (6).
+fn build_prefill_head(
+    talker: &TalkerWeights,
+    speaker_id: u32,
+    language_id: u32,
+    voice_embedding: Option<&[f32]>,
+) -> Vec<Vec<f32>> {
+    let mut head = build_role_prefix(talker);
+    if let Some(emb) = voice_embedding {
+        let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+        eprintln!("  Voice embedding norm={:.4}, injected with TTS_PAD overlay at position 4", norm);
+        head.extend(build_codec_prefix_voice(talker, language_id, emb));
+    } else {
+        head.extend(build_codec_prefix_builtin(talker, speaker_id, language_id));
+    }
+    head
+}
+
+/// Chunk-independent prefix of the ICL block: the first R pairs, where only
+/// ref_tokens meet the codec side (text_full[0..R] + codec_full[0..R],
+/// codec_full[0] = BOS then ref frames). Must use the exact same summation
+/// order as `build_icl_block` so cached KVs stay bit-identical.
+fn build_icl_prefix(
+    talker: &TalkerWeights,
+    predictor: &CodePredictorWeights,
+    ref_tokens: &[u32],
+    ref_codes: &[Vec<u32>],
+) -> Vec<Vec<f32>> {
+    let tv = ref_codes[0].len();
+    let mut prefix = Vec::with_capacity(ref_tokens.len());
+    for (i, &tok) in ref_tokens.iter().enumerate() {
+        let text_e = crate::talker::embed_text_token(talker, tok);
+        let codec_e = if i == 0 {
+            crate::talker::embed_codec_token(talker, CODEC_BOS)
+        } else {
+            // ref frame i-1 (codec_full[i] for i>=1); i <= R <= Tv holds in
+            // the pad branch (R+1 <= Tv+1); in the remainder branch the block
+            // is truncated to codec_len so i < codec_len <= Tv+1 either way.
+            // Guard the degenerate R > Tv case with PAD (never hit in practice).
+            if i - 1 < tv {
+                let t = i - 1;
+                let mut sum = crate::talker::embed_codec_token(talker, ref_codes[0][t]);
+                for g in 1..16 {
+                    let e = crate::code_predictor::get_acoustic_embedding(predictor, g - 1, ref_codes[g][t]);
+                    for j in 0..talker.hidden_size {
+                        sum[j] += e[j];
+                    }
+                }
+                sum
+            } else {
+                crate::talker::embed_codec_token(talker, CODEC_PAD)
+            }
+        };
+        prefix.push(add_embed(&text_e, &codec_e));
+    }
+    prefix
+}
+
+/// Pure split rule for the prefix-cache suffix path (unit-tested, no weights).
+/// `block_len` = full ICL block length, `r` = ref-token count, `prefix_len` =
+/// cached prefix length. Returns the suffix length to prefill, or None when
+/// the cache is unusable (length mismatch, degenerate coverage, empty suffix)
+/// and the caller must fall back to full prefill.
+pub fn prefix_suffix_split(block_len: usize, r: usize, prefix_len: usize) -> Option<usize> {
+    if prefix_len != 9 + r {
+        return None;
+    }
+    if r < block_len {
+        Some(block_len - r)
+    } else {
+        None
+    }
+}
+/// Cached chunk-independent talker prefix: KV after prefilling
+/// role(3) + codec header(6) + ICL ref part(R). `len` = 9+R (ICL) or 9.
+/// Per chunk, only the text-dependent suffix (block[R..]) is prefilled
+/// on top of a clone. Positions are absolute → the suffix lands exactly
+/// where a full prefill would put it (bit-identical, verified by sha256).
+pub struct TalkerPrefixCache {
+    pub kv: gemv::RawKvCache,
+    pub len: usize,
+}
+
+/// Prefill the chunk-independent prefix once per run. Returns None when
+/// there is nothing worth caching (no voice embedding and no ICL — the
+/// 9-position head alone saves too little to matter; caller falls back).
+pub fn build_talker_prefix(
+    talker: &TalkerWeights,
+    predictor: &CodePredictorWeights,
+    speaker_id: u32,
+    language_id: u32,
+    voice_embedding: Option<&[f32]>,
+    ref_text_tokens: Option<&[u32]>,
+    ref_codes: Option<&[Vec<u32>]>,
+) -> Option<TalkerPrefixCache> {
+    // Without ICL the reusable head is 9 positions of ~10 — skip.
+    let (rt, rc) = match (ref_text_tokens, ref_codes) {
+        (Some(rt), Some(rc)) => (rt, rc),
+        _ => return None,
+    };
+    let t = Instant::now();
+    let mut embeds = build_prefill_head(talker, speaker_id, language_id, voice_embedding);
+    embeds.extend(build_icl_prefix(talker, predictor, rt, rc));
+    let len = embeds.len();
+    let hidden = talker.hidden_size;
+    let flat: Vec<f32> = embeds.iter().flat_map(|e| e.iter().copied()).collect();
+    debug_assert_eq!(flat.len(), len * hidden);
+    let mut kv = gemv::empty_kv_cache(talker.num_layers(), talker.num_kv_heads, talker.head_dim);
+    let _ = crate::talker::prefill_talker_raw(talker, &flat, len, &mut kv);
+    eprintln!("Talker prefix cache: {len} positions in {:.1?} (reused by every chunk)", t.elapsed());
+    Some(TalkerPrefixCache { kv, len })
+}
+
 /// Prefill for CustomVoice matching qwen3-tts-rs structure
 /// Returns (last_hidden_state, logits) where:
 /// - last_hidden_state: [hidden_size] - the hidden state from the last position
@@ -334,6 +494,11 @@ pub fn generate_speech(
     // freshest context). Takes precedence over ref warmup when present.
     // Talker ICL still uses `ref_codes` — only the decoder source switches.
     chain_codes: Option<&[Vec<u32>]>,
+    // Talker prefix cache (P0): chunk-independent KV built once per run.
+    // When present and compatible (ICL block covers the cached R), only the
+    // text-dependent suffix is prefilled on top of a clone. None = legacy
+    // full prefill (single-chunk runs, non-ICL, or --no-prefix-cache).
+    talker_prefix: Option<&TalkerPrefixCache>,
 ) -> (Vec<f32>, Vec<Vec<u32>>) {
     let t0 = Instant::now();
 
@@ -354,19 +519,50 @@ pub fn generate_speech(
         _ => None,
     };
 
-    // Initialize KV cache
-    let mut talker_kv = gemv::empty_kv_cache(talker.num_layers(), talker.num_kv_heads, talker.head_dim);
-
-    // Prefill with proper dual-stream architecture
+    // Initialize KV cache (prefix-cache hit → clone, else fresh)
+    let mut talker_kv: gemv::RawKvCache;
     let t_prefill = Instant::now();
-    let (mut last_hidden, mut logits) = prefill_custom_voice(talker, &text_tokens, speaker_id, language_id, voice_embedding, &mut talker_kv, icl.as_ref().map(|(b, _)| b.as_slice()));
-    let mut position = match &icl {
-        // 3 role + 6 codec + ICL block (no first_text position, official streaming ICL)
-        Some((block, _)) => 9 + block.len(),
-        // legacy: 3 role + 6 codec + 1 first_text
-        None => if text_tokens.is_empty() { 9 } else { 10 },
+    let (mut last_hidden, mut logits);
+    let mut position: usize;
+    // Suffix path: usable iff ICL is active, the cache exists, the cached
+    // length matches 9+R, and the block covers R with a non-empty suffix.
+    // (Empty-suffix edge — empty text — falls back to exact full prefill.)
+    let use_suffix: bool = match (&icl, talker_prefix) {
+        (Some((block, _)), Some(pfx)) => {
+            let r = ref_text_tokens.as_ref().map(|t| t.len()).unwrap_or(0);
+            prefix_suffix_split(block.len(), r, pfx.len).is_some()
+        }
+        _ => false,
     };
-    eprintln!("Prefill done in {:.1?}, position={}", t_prefill.elapsed(), position);
+    if use_suffix {
+        let (block, _) = icl.as_ref().unwrap();
+        let pfx = talker_prefix.unwrap();
+        let r = ref_text_tokens.as_ref().unwrap().len();
+        talker_kv = pfx.kv.clone();
+        let hidden = talker.hidden_size;
+        let suffix: Vec<f32> = block[r..].iter().flat_map(|e| e.iter().copied()).collect();
+        let suffix_len = block.len() - r;
+        debug_assert_eq!(suffix.len(), suffix_len * hidden);
+        last_hidden = crate::talker::prefill_talker_raw_from(
+            talker, &suffix, suffix_len, &mut talker_kv, pfx.len);
+        logits = crate::talker::apply_codec_head(talker, &last_hidden);
+        position = 9 + block.len();
+        eprintln!("Prefill done in {:.1?}, position={} (suffix {} on cached {})",
+            t_prefill.elapsed(), position, suffix_len, pfx.len);
+    } else {
+        talker_kv = gemv::empty_kv_cache(talker.num_layers(), talker.num_kv_heads, talker.head_dim);
+        // Prefill with proper dual-stream architecture
+        let full = prefill_custom_voice(talker, &text_tokens, speaker_id, language_id, voice_embedding, &mut talker_kv, icl.as_ref().map(|(b, _)| b.as_slice()));
+        last_hidden = full.0;
+        logits = full.1;
+        position = match &icl {
+            // 3 role + 6 codec + ICL block (no first_text position, official streaming ICL)
+            Some((block, _)) => 9 + block.len(),
+            // legacy: 3 role + 6 codec + 1 first_text
+            None => if text_tokens.is_empty() { 9 } else { 10 },
+        };
+        eprintln!("Prefill done in {:.1?}, position={}", t_prefill.elapsed(), position);
+    }
 
     // Build trailing text embeddings (remaining text tokens after first + TTS_EOS).
     // ICL mode overrides this with the block remainder (may be empty → always pad).
@@ -769,6 +965,24 @@ mod tests {
         assert_eq!(warmup_tail(&codes, 2), vec![vec![4u32, 5], vec![9u32, 10]]);
         // empty
         assert!(warmup_tail(&[], 3).is_empty());
+    }
+
+    #[test]
+    fn test_prefix_suffix_split_hit() {
+        // R=35, block=162 → prefix 44, suffix 127
+        assert_eq!(prefix_suffix_split(162, 35, 44), Some(127));
+    }
+
+    #[test]
+    fn test_prefix_suffix_split_miss() {
+        // stale cache length
+        assert_eq!(prefix_suffix_split(162, 35, 43), None);
+        // degenerate: R covers the whole block (empty suffix → fallback)
+        assert_eq!(prefix_suffix_split(35, 35, 44), None);
+        // degenerate: R beyond block
+        assert_eq!(prefix_suffix_split(30, 35, 44), None);
+        // zero ref (non-ICL shape never reaches here, still defined)
+        assert_eq!(prefix_suffix_split(162, 0, 9), Some(162));
     }
 }
 

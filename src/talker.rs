@@ -367,6 +367,22 @@ pub fn prefill_talker_raw(
     seq_len: usize,
     kv_cache: &mut RawKvCache,
 ) -> Vec<f32> {
+    prefill_talker_raw_from(weights, x_in, seq_len, kv_cache, 0)
+}
+
+/// Prefill a suffix starting at absolute position `start_pos`, appending to
+/// the existing KV cache (which must already hold `start_pos` entries).
+/// With empty cache + start_pos 0 this is exactly `prefill_talker_raw`.
+/// Used for ICL prefix-cache reuse: the chunk-independent prefix
+/// (role + codec header + ref-text part of the ICL block) is prefilled once,
+/// each chunk then prefills only its text-dependent suffix.
+pub fn prefill_talker_raw_from(
+    weights: &TalkerWeights,
+    x_in: &[f32],
+    seq_len: usize,
+    kv_cache: &mut RawKvCache,
+    start_pos: usize,
+) -> Vec<f32> {
     let hidden = weights.hidden_size;
     let mut x = x_in.to_vec();
 
@@ -391,23 +407,27 @@ pub fn prefill_talker_raw(
             apply_qk_norm(&mut k_all[t * k_dim..(t + 1) * k_dim], weights.num_kv_heads, weights.head_dim, &lw.k_norm);
         }
 
-        // Multimodal RoPE
+        // Multimodal RoPE at absolute positions
         rope::apply_mrope_interleaved_batch(
             &mut q_all, seq_len, weights.num_heads, weights.head_dim,
-            &weights.mrope_section, 0, &weights.rope_cos, &weights.rope_sin,
+            &weights.mrope_section, start_pos, &weights.rope_cos, &weights.rope_sin,
         );
         rope::apply_mrope_interleaved_batch(
             &mut k_all, seq_len, weights.num_kv_heads, weights.head_dim,
-            &weights.mrope_section, 0, &weights.rope_cos, &weights.rope_sin,
+            &weights.mrope_section, start_pos, &weights.rope_cos, &weights.rope_sin,
         );
 
-        // KV cache
+        // KV cache append (prefix entries already present)
         let (ref mut cached_k, ref mut cached_v, ref mut cached_len) = kv_cache[i];
+        debug_assert_eq!(*cached_len, start_pos,
+            "prefix cache length mismatch at layer {i}");
         cached_k.extend_from_slice(&k_all);
         cached_v.extend_from_slice(&v_all);
-        *cached_len = seq_len;
+        *cached_len = start_pos + seq_len;
 
-        // Causal attention
+        // Causal attention over the FULL context (prefix + suffix).
+        // Suffix query t1 (global start_pos+t1) attends globals 0..=start_pos+t1,
+        // same ascending order as a single full prefill → bit-identical.
         let scale = 1.0 / (weights.head_dim as f32).sqrt();
         let kv_stride = weights.num_kv_heads * weights.head_dim;
         let mut attn_output = vec![0.0f32; seq_len * q_dim];
@@ -415,21 +435,21 @@ pub fn prefill_talker_raw(
         for h in 0..weights.num_heads {
             let kv_h = h / weights.num_kv_groups;
             for t1 in 0..seq_len {
-                let attend_len = t1 + 1;
+                let attend_len = start_pos + t1 + 1;
                 let q_off = t1 * q_dim + h * weights.head_dim;
                 let q_vec = &q_all[q_off..q_off + weights.head_dim];
                 let mut scores = vec![0.0f32; attend_len];
-                for t2 in 0..attend_len {
-                    let k_off = t2 * kv_stride + kv_h * weights.head_dim;
+                for s in 0..attend_len {
+                    let k_off = s * kv_stride + kv_h * weights.head_dim;
                     let mut dot = 0.0f32;
                     for d in 0..weights.head_dim { dot += q_vec[d] * cached_k[k_off + d]; }
-                    scores[t2] = dot * scale;
+                    scores[s] = dot * scale;
                 }
                 softmax_raw(&mut scores);
                 let out_off = t1 * q_dim + h * weights.head_dim;
-                for t2 in 0..attend_len {
-                    let v_off = t2 * kv_stride + kv_h * weights.head_dim;
-                    let score = scores[t2];
+                for s in 0..attend_len {
+                    let v_off = s * kv_stride + kv_h * weights.head_dim;
+                    let score = scores[s];
                     for d in 0..weights.head_dim {
                         attn_output[out_off + d] += score * cached_v[v_off + d];
                     }

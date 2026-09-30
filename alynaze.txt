@@ -8,6 +8,7 @@
 > 4. **Warmup 已经是链式的**（prev-chunk tail 12 帧，不是 ref），剩余 ~3% 要动 streaming decoder 重构，ROI 不足，已延期。"缓存 ref 中间状态"不要做。
 > 5. **量化状态已知**：talker Q4（1511MB/1.7B），手写 AVX2 核；本机无 AVX-512（运行时 dispatch，永不触发）。"检查 AVX-512/int8 GEMM"类建议跳过。
 > 6. **施工顺序**（有依赖）：① 前缀 KV 缓存（绝对位置已验证，精确复用，bit-identity 自证，约 -19%）→ ② 做完 ① 后**重算**合并短句的收益（长生成漂移与 per-frame 变慢是真实代价，合并目标取 `80~150 chars` 适中，不无脑合到 500）→ ③ allocator/LTO 先测量再要 → ④ iGPU/量化不出本次 scope。
+> 8. **P0 前缀缓存已落地并纠正预期（2026-09-30 实测）**：① 只 cache 了 `9+R`（约 38/151，ICL 把本块文本揉进 block 前部，171 并非完全相同——原文"完全相同"有误）；② suffix-prefill 6.1s vs 全量 7.2s，prefill 是 overhead-dominated 非长度线性，**实测仅省 ~1.2s/块，长文档约 -3%**，不是 §2 预估的 -19%/250~350s。实现 bit-exact（同 seed 开/关 sha256 一致），默认开（`--no-prefix-cache` 回退）。真正的 P0 大头是**合并短 chunk**（每消灭一块省整个 8s prefill + decode）。
 > 7. 术语：RTF 5.14x 即 0.19x realtime（RTF>1 = 慢于实时），全文统一按 RTF 表述。
 >
 > ---

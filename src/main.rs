@@ -37,6 +37,7 @@ fn main() {
     // --chain-warmup [N] overrides length, --no-chain-warmup disables.
     let mut chain_frames: usize = 12;
     let mut chain_explicit = false;
+    let mut no_prefix_cache = false;
     let mut check_target: Option<Option<PathBuf>> = None;
     let mut i = 1;
     while i < args.len() {
@@ -186,6 +187,9 @@ fn main() {
             "--no-chain-warmup" => {
                 chain_explicit = true;
                 chain_frames = 0;
+            }
+            "--no-prefix-cache" => {
+                no_prefix_cache = true;
             }
             "--save-voice" => {
                 if i + 1 < args.len() {
@@ -549,6 +553,20 @@ fn main() {
     if chain_explicit && chain_frames > 0 && chunks.len() < 2 {
         eprintln!("--chain-warmup needs at least 2 chunks, ignoring");
     }
+    // P0 talker prefix cache: chunk-independent head (role + codec header +
+    // ICL ref part, 9+R positions) prefilled once, cloned per chunk. Only
+    // for multi-chunk ICL runs; single-chunk/non-ICL fall back to full
+    // prefill. --no-prefix-cache forces the legacy path (bit-identity check).
+    let talker_prefix = if !no_prefix_cache && chunks.len() > 1 {
+        qora_tts::generate_new::build_talker_prefix(
+            &talker, &predictor, speaker_id, language_id,
+            voice_embedding.as_deref(),
+            ref_text_tokens.as_deref(),
+            ref_codes.as_deref(),
+        )
+    } else {
+        None
+    };
     let mut prev_tail: Option<Vec<Vec<u32>>> = None;
     for (idx, chunk_text) in chunks.iter().enumerate() {
         if chunks.len() > 1 {
@@ -580,6 +598,7 @@ fn main() {
             ref_text_tokens.clone(),
             ref_codes.as_deref(),
             chain_src,
+            talker_prefix.as_ref(),
         );
         audios.push(audio);
         // Save this chunk's tail for the next chunk's decoder warmup.

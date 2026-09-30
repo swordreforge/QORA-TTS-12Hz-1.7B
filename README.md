@@ -170,6 +170,7 @@ System: 16384 MB RAM (9856 MB free), 12 threads
 | `--decode-warmup` | off | Quality path: prepend ref codes so the decoder starts warm (official parity; fixes cold-start attacks, onset HNR 0.55→0.93). Costs decode time ∝ ref length. Default off = fast cold path |
 | `--warmup-frames <n>` | 0 = full | Cap warmup to trailing N ref frames (implies warmup). Smooth tradeoff: 8 layers × 72-frame window ≈ 576-frame effective memory, so k72 ≈ 4x closer to full than cold at ~60% of the cost |
 | `--chain-warmup [n]` | on, n=12 | Chained decoder warmup: chunk N+1 prepends chunk N's tail (same voice, freshest context; cost ⊥ ref length, +~1.4s/chunk at n=12). Measured: onset HNR 0.78→0.92 at n=12; n=4 ≈ no-op. First chunk falls back to ref/cold setting. `--no-chain-warmup` disables |
+| (talker prefix cache) | on (multi-chunk ICL) | Chunk-independent head (role+codec header+ICL ref part, 9+R) prefilled once, per-chunk suffix only. Bit-exact (sha-verified). Measured ~1.2s/chunk (~3% long-doc); prefill is overhead-dominated, not length-proportional. `--no-prefix-cache` forces legacy full prefill |
 | `--language <name>` | english | Target language |
 | `--output <path>` | output.wav | Output WAV path |
 | `--max-codes <n>` | 500 | Max code timesteps (~n/12.5 seconds) |
