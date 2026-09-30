@@ -1,4 +1,4 @@
-//! Rule-based Chinese text normalization for TTS (numbers and units).
+//! Rule-based Chinese text normalization for TTS (numbers, units, code tokens).
 //!
 //! The small LM mangles raw digits ("RTF为4.78", "2020年", "-40dB").
 //! v1 scope is deliberately narrow — numeric tokens only; Latin prose and
@@ -10,6 +10,14 @@
 //! - N~M / N～M / N-M (digits both sides) → N到M
 //! - leading -/－ before digits → 负 (负四十)
 //! - ° → 度, ×/*/÷ → 乘/乘/除以
+//! v2 adds code-token stabilization (runs AFTER numbers, so decimal dots
+//! are already gone and remaining ASCII dots are code/abbreviation dots):
+//! - identifier dots → 点 (torch.no_grad → torch点no grad): kills the
+//!   English-period prosody stutter on code and keeps dotted names in one
+//!   prosodic unit (code-dense text otherwise wanders into silence defects)
+//! - underscores inside words → space (no_grad → no grad)
+//! - standalone True/False/None → 真/假/空 (Python booleans read naturally)
+//! - sentence dots (followed by space/end/punct) are kept for prosody
 //! Anything unrecognized passes through byte-identical.
 
 const D: [&str; 10] = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
@@ -130,6 +138,71 @@ pub fn normalize(text: &str) -> String {
             '~' | '～' => out.push_str("到"),
             _ => out.push(c),
         }
+        i += 1;
+    }
+    normalize_code(&out)
+}
+
+/// Code-token stabilization for Chinese TTS (v2, runs after numbers).
+/// Dotted identifiers (`torch.no_grad`) otherwise trigger English-period
+/// prosody at every dot and destabilize sampling on code-dense text.
+/// Only dots/glue INSIDE words are rewritten; sentence dots survive.
+pub fn normalize_code(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    while i < chars.len() {
+        let c = chars[i];
+        // Standalone Python booleans (word-bounded, exact case only).
+        // "NoneType" / "Falsehood" must not match: check both sides.
+        if (c == 'T' || c == 'F' || c == 'N')
+            && (i == 0 || !is_word(chars[i - 1]) && chars[i - 1] != '.')
+        {
+            let rest = if c == 'T' { "rue" } else if c == 'F' { "alse" } else { "one" };
+            let word: String = chars[i..].iter().take(rest.len() + 1).collect();
+            let expect = format!("{c}{rest}");
+            if word == expect {
+                let after = i + rest.len() + 1;
+                if after >= chars.len() || (!is_word(chars[after]) && chars[after] != '.') {
+                    out.push_str(if c == 'T' { "真" } else if c == 'F' { "假" } else { "空" });
+                    i = after;
+                    continue;
+                }
+            }
+        }
+        if c == '.' {
+            let next = if i + 1 < chars.len() { Some(chars[i + 1]) } else { None };
+            match next {
+                // identifier dot: torch.no_grad, cudnn.benchmark, e.g.
+                Some(n) if n.is_ascii_alphanumeric() || n == '_' => {
+                    out.push_str("点");
+                    i += 1;
+                    continue;
+                }
+                // leading-dot decimal (.5秒): prev must not be a word char
+                // (digit.digit was already consumed by the number parser).
+                Some(n) if n.is_ascii_digit() && (i == 0 || !is_word(chars[i - 1])) => {
+                    out.push_str("零点");
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // underscore glue inside words: no_grad → no grad.
+        if c == '_' && i > 0 && i + 1 < chars.len()
+            && chars[i - 1].is_ascii_alphanumeric()
+            && chars[i + 1].is_ascii_alphanumeric()
+        {
+            out.push(' ');
+            i += 1;
+            continue;
+        }
+        out.push(c);
         i += 1;
     }
     out
@@ -283,6 +356,55 @@ mod tests {
         assert_eq!(normalize("你好，世界。"), "你好，世界。");
         assert_eq!(normalize("Hello world"), "Hello world");
         assert_eq!(normalize(""), "");
+    }
+
+    #[test]
+    fn test_normalize_code_dots() {
+        assert_eq!(normalize_code("torch.no_grad"), "torch点no grad");
+        assert_eq!(
+            normalize_code("torch.backends.cudnn.benchmark"),
+            "torch点backends点cudnn点benchmark"
+        );
+        // sentence dots survive (prosody)
+        assert_eq!(normalize_code("Hello. World"), "Hello. World");
+        assert_eq!(normalize_code("结尾."), "结尾.");
+        // decimals already handled upstream; code pass must not touch CJK 点
+        assert_eq!(normalize_code("四点七八"), "四点七八");
+        // full pipeline: numbers first, code second
+        assert_eq!(normalize("RTF为4.78"), "RTF为四点七八");
+        assert_eq!(normalize("torch.no_grad的开销3.5秒"), "torch点no grad的开销三点五秒");
+    }
+
+    #[test]
+    fn test_normalize_code_underscore_edges() {
+        assert_eq!(normalize_code("no_grad"), "no grad");
+        assert_eq!(normalize_code("empty_cache"), "empty cache");
+        assert_eq!(normalize_code("_private"), "_private");
+        assert_eq!(normalize_code("trailing_"), "trailing_");
+        assert_eq!(normalize_code("a__b"), "a__b"); // only single glue between alnums
+    }
+
+    #[test]
+    fn test_normalize_code_booleans() {
+        assert_eq!(normalize_code("设置为 True 时"), "设置为 真 时");
+        assert_eq!(normalize_code("(False、None)"), "(假、空)");
+        // must not fire inside longer words or dotted paths
+        assert_eq!(normalize_code("NoneType"), "NoneType");
+        assert_eq!(normalize_code("Falsehood"), "Falsehood");
+        assert_eq!(normalize_code("torch.True"), "torch点True");
+        // lowercase untouched (plain English words, out of scope)
+        assert_eq!(normalize_code("true cost"), "true cost");
+    }
+
+    #[test]
+    fn test_normalize_code_suspect_sentence() {
+        // the pytorch_issue_on_gpu.py chunk-8 sentence (122s silence hole):
+        // dots must become 点, True → 真, no sentence split inside.
+        let inp = "当 torch.backends.cudnn.benchmark 设置为 True 时，cuDNN 会在第一次运行某个 shape 的卷积时，测试几种不同的卷积算法，选出最快的一种缓存下来，之后相同 shape 都使用这个算法。";
+        let exp = "当 torch点backends点cudnn点benchmark 设置为 真 时，cuDNN 会在第一次运行某个 shape 的卷积时，测试几种不同的卷积算法，选出最快的一种缓存下来，之后相同 shape 都使用这个算法。";
+        assert_eq!(normalize(inp), exp);
+        // idempotent: second pass changes nothing
+        assert_eq!(normalize(&normalize(inp)), exp);
     }
 
     #[test]
