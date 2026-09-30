@@ -77,6 +77,9 @@ QORA_DUMP_CODES=debug.codes qora-tts.exe --ref-audio my_recording.wav --text "Su
 Chinese input is automatically number-normalized before synthesis
 (`RTF为4.78` → `RTF为四点七八`, `2020年` → `二零二零年`,
 `RTX 4090` → `RTX 四零九零`, `-40dB` → `负四十dB`);
+Japanese gets the same treatment with its own rules
+(`4月1日` → `シガツツイタチ`, `35%` → `サンジュウゴパーセント`,
+`2020年` → `ニセンニジュウネン`).
 reference transcripts (`--ref-text`) get the same treatment so text
 stays aligned with how the digits were spoken. Other languages pass
 through untouched.

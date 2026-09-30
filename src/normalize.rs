@@ -214,11 +214,13 @@ fn parse_number(chars: &[char], i: usize, force_dw: bool) -> (String, usize) {
     (word, j)
 }
 
-/// Language-aware entry: Chinese gets number normalization, other
-/// languages pass through (English number words are future work).
+/// Language-aware entry: Chinese and Japanese get number normalization,
+/// other languages pass through (English number words are future work).
 pub fn normalize_for_language(text: &str, language: &str) -> String {
     if language.eq_ignore_ascii_case("chinese") {
         normalize(text)
+    } else if language.eq_ignore_ascii_case("japanese") {
+        crate::normalize_ja::normalize(text)
     } else {
         text.to_string()
     }
@@ -288,5 +290,8 @@ mod tests {
         assert_eq!(normalize_for_language("2020年", "chinese"), "二零二零年");
         assert_eq!(normalize_for_language("2020年", "english"), "2020年");
         assert_eq!(normalize_for_language("2020年", "Chinese"), "二零二零年");
+        assert_eq!(normalize_for_language("4月1日", "japanese"), "シガツツイタチ");
+        assert_eq!(normalize_for_language("4月1日", "english"), "4月1日");
+        assert_eq!(normalize_for_language("2020年", "japanese"), "ニセンニジュウネン");
     }
 }

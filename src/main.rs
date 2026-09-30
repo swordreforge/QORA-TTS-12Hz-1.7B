@@ -483,8 +483,8 @@ fn main() {
         .into_iter()
         .map(|c| qora_tts::normalize::normalize_for_language(&c, &language))
         .collect();
-    if language.eq_ignore_ascii_case("chinese") {
-        eprintln!("Number normalization applied (chinese)");
+    if language.eq_ignore_ascii_case("chinese") || language.eq_ignore_ascii_case("japanese") {
+        eprintln!("Number normalization applied ({language})");
     }
     let mut audios: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
     for (idx, chunk_text) in chunks.iter().enumerate() {
