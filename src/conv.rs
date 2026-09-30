@@ -385,11 +385,13 @@ fn dw_conv1d_range(
 /// SnakeBeta: x + (1/exp(beta)) * sin^2(exp(alpha) * x)
 /// Multi-threaded by channels.
 pub fn snake_beta(input: &[f32], alpha: &[f32], beta: &[f32], channels: usize) -> Vec<f32> {
+    let t0 = snake_stats_on().then(std::time::Instant::now);
     let length = input.len() / channels;
     let mut output = vec![0.0f32; input.len()];
 
     if channels * length < 500_000 {
         snake_beta_range(input, alpha, beta, 0, channels, length, &mut output);
+        snake_stats_record(t0, input.len() as u64);
         return output;
     }
 
@@ -414,7 +416,46 @@ pub fn snake_beta(input: &[f32], alpha: &[f32], beta: &[f32], channels: usize) -
             });
         }
     });
+    snake_stats_record(t0, input.len() as u64);
     output
+}
+
+// --- snake stats (QORA_SNAKE_STATS=1): call count, total ns, total elements.
+// Accumulates only when enabled (OnceLock gate, zero cost otherwise).
+static SNAKE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static SNAKE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SNAKE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SNAKE_ELS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn snake_stats_on() -> bool {
+    *SNAKE_ON.get_or_init(|| {
+        std::env::var("QORA_SNAKE_STATS").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+fn snake_stats_record(t0: Option<std::time::Instant>, els: u64) {
+    if let Some(t) = t0 {
+        use std::sync::atomic::Ordering::Relaxed;
+        SNAKE_CALLS.fetch_add(1, Relaxed);
+        SNAKE_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        SNAKE_ELS.fetch_add(els, Relaxed);
+    }
+}
+
+/// One-line report for the decode split log. Returns None when disabled.
+pub fn snake_stats_report() -> Option<String> {
+    if !snake_stats_on() {
+        return None;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = SNAKE_CALLS.load(Relaxed);
+    let ns = SNAKE_NS.load(Relaxed);
+    let els = SNAKE_ELS.load(Relaxed);
+    Some(format!(
+        "snake x{c} calls, {:.1}s total, {:.1}M el/call",
+        ns as f64 / 1e9,
+        els as f64 / c.max(1) as f64 / 1e6
+    ))
 }
 
 #[inline]

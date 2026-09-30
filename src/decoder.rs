@@ -562,6 +562,9 @@ pub fn decode_to_audio(
     eprintln!("  Audio: {} samples ({:.1}s at 24kHz)", signal.len(), signal.len() as f32 / 24000.0);
     eprintln!("  Decode split: transformer {:.1?}, upsample {:.1?}, vocos-blocks {:.1?}, other {:.1?}",
         t_tf, t_up, t_blk, s_tf.elapsed() - t_tf - t_up - t_blk);
+    if let Some(rep) = crate::conv::snake_stats_report() {
+        eprintln!("  {rep}");
+    }
     signal
 }
 
