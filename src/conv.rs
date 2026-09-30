@@ -247,6 +247,10 @@ pub struct ConvTranspose1dWeight {
 pub fn conv_transpose1d(input: &[f32], w: &ConvTranspose1dWeight) -> Vec<f32> {
     let in_len = input.len() / w.in_channels;
     let out_len = (in_len - 1) * w.stride - 2 * w.padding + w.kernel_size;
+    if std::env::var("QORA_CONVT_SHAPES").as_deref() == Ok("1") {
+        eprintln!("  [convt] ic={} oc={} k={} s={} in={} out={}",
+            w.in_channels, w.out_channels, w.kernel_size, w.stride, in_len, out_len);
+    }
     let mut output = vec![0.0f32; w.out_channels * out_len];
 
     let ops = w.in_channels * w.out_channels * w.kernel_size * in_len;
@@ -280,8 +284,40 @@ pub fn conv_transpose1d(input: &[f32], w: &ConvTranspose1dWeight) -> Vec<f32> {
 }
 
 /// Per output channel: gather contributions from all input channels.
+/// Dispatch: AVX2 8-tap kernel when available, scalar oracle otherwise.
+/// Both produce bit-identical output (same visit order, mul+add per lane);
+/// the golden test below guards this on multi-tile shapes.
 #[inline]
 fn conv_transpose1d_range(
+    input: &[f32], w: &ConvTranspose1dWeight,
+    oc_start: usize, oc_end: usize,
+    in_len: usize, out_len: usize,
+    output: &mut [f32],
+) {
+    // Bias fill (once per row, both paths — the kernels only accumulate)
+    for oc in oc_start..oc_end {
+        let local_oc = oc - oc_start;
+        for o in 0..out_len {
+            output[local_oc * out_len + o] = w.bias[oc];
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::has_avx2() {
+        unsafe {
+            crate::simd::conv_transpose1d_range_avx2(
+                input, &w.weight,
+                w.in_channels, w.out_channels,
+                w.kernel_size, w.stride, w.padding,
+                oc_start, oc_end, in_len, out_len, output,
+            );
+        }
+        return;
+    }
+    conv_transpose1d_range_scalar(input, w, oc_start, oc_end, in_len, out_len, output);
+}
+
+#[inline]
+fn conv_transpose1d_range_scalar(
     input: &[f32], w: &ConvTranspose1dWeight,
     oc_start: usize, oc_end: usize,
     in_len: usize, out_len: usize,
@@ -290,10 +326,6 @@ fn conv_transpose1d_range(
     for oc in oc_start..oc_end {
         let local_oc = oc - oc_start;
         let out_row = local_oc * out_len;
-        // Initialize with bias
-        for o in 0..out_len {
-            output[out_row + o] = w.bias[oc];
-        }
         // Gather from all input channels
         for ic in 0..w.in_channels {
             let in_row = ic * in_len;

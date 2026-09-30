@@ -445,6 +445,75 @@ unsafe fn causal_range_fma(
 }
 
 // ============================================================
+// ConvTranspose1d range — AVX2 (8-wide over kernel taps)
+// ============================================================
+
+/// AVX2 transposed-conv accumulation over output channels
+/// `[oc_start, oc_end)`. Bit-exact mirror of `conv_transpose1d_range`
+/// (scalar): same visit order (oc → ic → i → ascending k), bias NOT
+/// touched here (caller fills once). For fixed (ic,i) the k taps hit
+/// CONSECUTIVE outputs, so an 8-tap chunk is one vector load (weights) +
+/// one vector load/mul-add/store (outputs); tail taps stay scalar.
+/// Bounds are hoisted per i (klo/khi) instead of per (i,k).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn conv_transpose1d_range_avx2(
+    input: &[f32],
+    weight: &[f32], // [in_ch, out_ch_total, ksize] row-major
+    in_ch: usize,
+    out_ch_total: usize,
+    ksize: usize,
+    stride: usize,
+    padding: usize,
+    oc_start: usize,
+    oc_end: usize,
+    in_len: usize,
+    out_len: usize,
+    output: &mut [f32],
+) {
+    let pad = padding as isize;
+    let stride = stride as isize;
+    for oc in oc_start..oc_end {
+        let local_oc = oc - oc_start;
+        let out_base = local_oc * out_len;
+        for ic in 0..in_ch {
+            let in_row = ic * in_len;
+            let w_base = ic * out_ch_total * ksize + oc * ksize;
+            for i in 0..in_len {
+                let val = *input.get_unchecked(in_row + i);
+                if val == 0.0 {
+                    continue;
+                }
+                // valid tap range for this i (hoisted, was per-(i,k) branch)
+                let klo = (0isize).max(pad - i as isize * stride);
+                let khi = (ksize as isize).min(out_len as isize + pad - i as isize * stride);
+                if khi <= klo {
+                    continue;
+                }
+                let (klo, khi) = (klo as usize, khi as usize);
+                let vb = _mm256_set1_ps(val);
+                // 8-tap vector chunks (ascending k, same per-lane order)
+                let mut kb = klo;
+                while kb + 8 <= khi {
+                    let o0 = (i as isize * stride + kb as isize - pad) as usize;
+                    let wv = _mm256_loadu_ps(weight.as_ptr().add(w_base + kb));
+                    let acc = _mm256_loadu_ps(output.as_ptr().add(out_base + o0));
+                    let res = _mm256_add_ps(acc, _mm256_mul_ps(vb, wv));
+                    _mm256_storeu_ps(output.as_mut_ptr().add(out_base + o0), res);
+                    kb += 8;
+                }
+                // tail taps scalar (k < 8 kernels live entirely here)
+                for k in kb..khi {
+                    let o = (i as isize * stride + k as isize - pad) as usize;
+                    let out_ptr = output.as_mut_ptr().add(out_base + o);
+                    *out_ptr += val * *weight.get_unchecked(w_base + k);
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
 // F16 GEMV — AVX-512
 // ============================================================
 
