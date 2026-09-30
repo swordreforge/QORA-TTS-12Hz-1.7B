@@ -32,6 +32,7 @@ fn main() {
     let mut save_voice_path: Option<PathBuf> = None;
     let mut decode_warmup = false;
     let mut warmup_frames: usize = 0;
+    let mut chain_frames: usize = 0;
     let mut check_target: Option<Option<PathBuf>> = None;
     let mut i = 1;
     while i < args.len() {
@@ -165,6 +166,20 @@ fn main() {
                     warmup_frames = args[i + 1].parse().unwrap_or(0);
                     decode_warmup = true; // implying warmup
                     i += 1;
+                }
+            }
+            "--chain-warmup" => {
+                // Optional length (frames, ~12.5/s). Default 12: measured
+                // minimum effective dose (4 ≈ no-op, 12 cleans the attack).
+                if i + 1 < args.len() {
+                    if let Ok(n) = args[i + 1].parse::<usize>() {
+                        chain_frames = n.max(1);
+                        i += 1;
+                    } else {
+                        chain_frames = 12;
+                    }
+                } else {
+                    chain_frames = 12;
                 }
             }
             "--save-voice" => {
@@ -499,13 +514,23 @@ fn main() {
         eprintln!("Number normalization applied ({language})");
     }
     let mut audios: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+    // Chained decoder warmup: tail codes of the previous chunk seed the next
+    // chunk's decode (same voice, freshest context, cost independent of ref
+    // length). First chunk falls back to the ref/cold setting. Talker ICL is
+    // unaffected (still uses ref_codes).
+    if chain_frames > 0 && chunks.len() < 2 {
+        eprintln!("--chain-warmup needs at least 2 chunks, ignoring");
+    }
+    let mut prev_tail: Option<Vec<Vec<u32>>> = None;
     for (idx, chunk_text) in chunks.iter().enumerate() {
         if chunks.len() > 1 {
             eprintln!("--- Chunk {}/{} ({} chars) ---", idx + 1, chunks.len(), chunk_text.chars().count());
         }
         // Deterministic per-chunk seeds when a base seed is given
         let chunk_seed = seed.map(|s| s.wrapping_add(idx as u64));
-        audios.push(qora_tts::generate_new::generate_speech(
+        let chain_src: Option<&[Vec<u32>]> =
+            if chain_frames > 0 && idx > 0 { prev_tail.as_deref() } else { None };
+        let (audio, codes) = qora_tts::generate_new::generate_speech(
             &talker, &predictor, &decoder, &tokenizer,
             chunk_text, speaker_id, language_id,
             voice_codes.as_deref(),
@@ -526,7 +551,16 @@ fn main() {
             chunk_seed,
             ref_text_tokens.clone(),
             ref_codes.as_deref(),
-        ));
+            chain_src,
+        );
+        audios.push(audio);
+        // Save this chunk's tail for the next chunk's decoder warmup.
+        // warmup_tail reuses the tested helper (k>=frames → full passthrough).
+        prev_tail = if chain_frames > 0 && !codes.is_empty() && !codes[0].is_empty() {
+            Some(qora_tts::generate_new::warmup_tail(&codes, chain_frames))
+        } else {
+            None
+        };
     }
     // 30ms crossfade between chunks to avoid clicks.
     // Seam hygiene: trim each chunk BEFORE joining (when requested) so the

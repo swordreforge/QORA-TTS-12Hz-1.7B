@@ -330,7 +330,11 @@ pub fn generate_speech(
     seed: Option<u64>,
     ref_text_tokens: Option<Vec<u32>>,
     ref_codes: Option<&[Vec<u32>]>,
-) -> Vec<f32> {
+    // Chained decoder warmup: tail codes of the previous chunk (same voice,
+    // freshest context). Takes precedence over ref warmup when present.
+    // Talker ICL still uses `ref_codes` — only the decoder source switches.
+    chain_codes: Option<&[Vec<u32>]>,
+) -> (Vec<f32>, Vec<Vec<u32>>) {
     let t0 = Instant::now();
 
     // Tokenize text
@@ -477,8 +481,14 @@ pub fn generate_speech(
     // Decode to audio
     let t_decode = Instant::now();
     let warmed: Vec<Vec<u32>>;
-    let warmup_opt: Option<&[Vec<u32>]> = if params.decode_warmup {
-        match ref_codes.as_deref() {
+    // Chained tail (previous chunk, same voice) wins over ref warmup:
+    // fresher context, bounded cost independent of ref length.
+    let warmup_opt: Option<&[Vec<u32>]> = match chain_codes {
+        Some(cc) if !cc.is_empty() && !cc[0].is_empty() => {
+            eprintln!("  Decoder warmup: chained {} frames (prev chunk tail)", cc[0].len());
+            Some(cc)
+        }
+        _ if params.decode_warmup => match ref_codes.as_deref() {
             Some(rc) if params.warmup_frames > 0 => {
                 warmed = warmup_tail(rc, params.warmup_frames);
                 eprintln!("  Decoder warmup: trailing {} of {} ref frames",
@@ -486,9 +496,8 @@ pub fn generate_speech(
                 Some(&warmed)
             }
             other => other,
-        }
-    } else {
-        None
+        },
+        _ => None,
     };
     let audio = crate::decoder::decode_to_audio(
         decoder,
@@ -498,7 +507,7 @@ pub fn generate_speech(
     eprintln!("Decode done in {:.1?}", t_decode.elapsed());
 
     eprintln!("Total: {:.1?}", t0.elapsed());
-    audio
+    (audio, all_codes)
 }
 
 /// Trailing-K slice of ref codes for decoder warmup (see TTSParams).
