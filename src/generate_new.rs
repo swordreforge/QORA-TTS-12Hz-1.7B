@@ -598,6 +598,10 @@ pub fn generate_speech(
     };
 
     let t_gen = Instant::now();
+    // Phase split (GPT review P0): talker forward vs predictor per frame.
+    // Sampling/pushes are unattributed (µs). Printed on the done line.
+    let mut t_talker = std::time::Duration::ZERO;
+    let mut t_pred = std::time::Duration::ZERO;
 
     for frame_idx in 0..params.max_codes {
         // Sample semantic token from logits (onset schedule for chunk attacks)
@@ -616,12 +620,15 @@ pub fn generate_speech(
         let semantic_embed = crate::talker::embed_codec_token(talker, semantic_token);
 
         // Generate 15 acoustic codes using code predictor
+        // (prefill 2 + 14 AR steps, 5 layers each — timed separately)
+        let s_pred = Instant::now();
         let acoustic_codes = crate::code_predictor::generate_acoustic_codes(
             predictor,
             &last_hidden,
             &semantic_embed,
             &mut predictor_kv,
         );
+        t_pred += s_pred.elapsed();
 
         for (i, &code) in acoustic_codes.iter().enumerate() {
             all_codes[i + 1].push(code);
@@ -647,7 +654,9 @@ pub fn generate_speech(
         }
 
         // Forward through talker with combined embedding
+        let s_talk = Instant::now();
         let result = crate::talker::forward_with_embedding(talker, &combined_embed, &mut talker_kv, position);
+        t_talker += s_talk.elapsed();
 
         // Extract hidden state (first hidden_size elements) and logits (rest)
         let hidden_size = talker.hidden_size;
@@ -660,7 +669,8 @@ pub fn generate_speech(
         }
     }
 
-    eprintln!("\nGeneration done in {:.1?} ({} frames)", t_gen.elapsed(), all_codes[0].len());
+    eprintln!("\nGeneration done in {:.1?} ({} frames, talker {:.1?}, predictor {:.1?})",
+        t_gen.elapsed(), all_codes[0].len(), t_talker, t_pred);
 
     // Diagnostic dump of generated codes (VCOD format, same as --voice-codes
     // input). Gated by QORA_DUMP_CODES=<path>; used to inspect frame-level
