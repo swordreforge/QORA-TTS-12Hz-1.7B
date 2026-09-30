@@ -967,6 +967,67 @@ mod tests {
         );
     }
 
+    /// Warmup-equivalence ladder (ignored, needs weights + model binary):
+    /// decode the same tail frames cold vs trailing-K vs full prepend and
+    /// compare. Validates that trailing-72 ≈ full (attention window covered)
+    /// while cold diverges at onset. Run:
+    /// `QORA_ST_WEIGHTS=... QORA_MODEL=... cargo test --release --lib codec_encoder -- --ignored`
+    #[test]
+    #[ignore]
+    fn test_warmup_equivalence_ladder() {
+        let enc_path = std::env::var("QORA_ST_WEIGHTS").expect("set QORA_ST_WEIGHTS");
+        let model_path = std::env::var("QORA_MODEL")
+            .unwrap_or_else(|_| "target/release/model.qora-tts".to_string());
+        let w = load_codec_encoder(std::path::Path::new(&enc_path)).expect("encoder load");
+        let (audio, _) =
+            crate::wav::read_wav(std::path::Path::new("voice/mum3bv.wav")).expect("wav");
+        let codes = encode_waveform_to_codes(&w, &audio);
+        let (_talker, _predictor, decoder, _) =
+            crate::save::load_model(std::path::Path::new(&model_path)).expect("model load");
+
+        // gen = last 41 frames, warmup pool = first 100 frames
+        let take = |a: usize, b: usize| -> Vec<Vec<u32>> {
+            codes.iter().map(|q| q[a..b].to_vec()).collect()
+        };
+        let gen = take(100, 141);
+        let full = take(0, 100);
+        let k72 = take(28, 100);
+        let k32 = take(68, 100);
+
+        let o_cold = crate::decoder::decode_to_audio(&decoder, &gen, None);
+        let o_full = crate::decoder::decode_to_audio(&decoder, &gen, Some(&full));
+        let o_72 = crate::decoder::decode_to_audio(&decoder, &gen, Some(&k72));
+        let o_32 = crate::decoder::decode_to_audio(&decoder, &gen, Some(&k32));
+        assert_eq!(o_cold.len(), o_full.len());
+        assert_eq!(o_cold.len(), o_72.len());
+
+        let diff = |a: &[f32], b: &[f32]| -> (f32, f32) {
+            // (max abs diff over first 0.5s, ... over body after 1s)
+            let h1 = a.iter().zip(b.iter()).take(12000).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            let h2 = a.iter().zip(b.iter()).skip(24000).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            (h1, h2)
+        };
+        // K sweep: where does body convergence happen?
+        for k in [72usize, 48, 32, 16, 8] {
+            let wk = take(100 - k, 100);
+            let o_k = crate::decoder::decode_to_audio(&decoder, &gen, Some(&wk));
+            let (h, b) = diff(&o_full, &o_k);
+            eprintln!("full-vs-k{k:<3}: head {h:.2e} body {b:.2e}");
+        }
+        let (c_full_h, c_full_b) = diff(&o_cold, &o_full);
+        let (k72_h, k72_b) = diff(&o_full, &o_72);
+        let (k32_h, k32_b) = diff(&o_full, &o_32);
+        eprintln!("cold-vs-full : head {c_full_h:.2e} body {c_full_b:.2e} (warmup must matter at onset)");
+        eprintln!("full-vs-k72  : head {k72_h:.2e} body {k72_b:.2e} (window covered, residual = depth propagation)");
+        eprintln!("full-vs-k32  : head {k32_h:.2e} body {k32_b:.2e} (expect small onset diff)");
+        // Tradeoff curve (NOT a cliff): 8 layers x 72-frame window = ~576-frame
+        // effective memory, so distant warmup frames still matter through depth.
+        // k72 ≈ 4x closer than cold; k32 ≈ 2.5x. Assert the curve shape.
+        assert!(c_full_h > 1e-4, "warmup should change the onset vs cold");
+        assert!(k72_b < c_full_b / 2.0, "k72 must beat cold clearly");
+        assert!(k32_b < c_full_b, "k32 must beat cold");
+    }
+
     /// Full weight load against the real `speech_tokenizer/model.safetensors`.
     /// Ignored by default (needs 651MB file): 
     /// `QORA_ST_WEIGHTS=/tmp/opencode/st_model.safetensors cargo test --lib codec_encoder -- --ignored`

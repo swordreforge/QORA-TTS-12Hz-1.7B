@@ -31,6 +31,7 @@ fn main() {
     let mut load_voice_path: Option<PathBuf> = None;
     let mut save_voice_path: Option<PathBuf> = None;
     let mut decode_warmup = false;
+    let mut warmup_frames: usize = 0;
     let mut check_target: Option<Option<PathBuf>> = None;
     let mut i = 1;
     while i < args.len() {
@@ -158,6 +159,13 @@ fn main() {
             }
             "--decode-warmup" => {
                 decode_warmup = true;
+            }
+            "--warmup-frames" => {
+                if i + 1 < args.len() {
+                    warmup_frames = args[i + 1].parse().unwrap_or(0);
+                    decode_warmup = true; // implying warmup
+                    i += 1;
+                }
             }
             "--save-voice" => {
                 if i + 1 < args.len() {
@@ -513,6 +521,7 @@ fn main() {
                 onset_frames,
                 onset_temperature,
                 decode_warmup,
+                warmup_frames,
             },
             chunk_seed,
             ref_text_tokens.clone(),

@@ -168,6 +168,7 @@ System: 16384 MB RAM (9856 MB free), 12 threads
 | `--save-voice <file>` | - | Save voice profile (embedding + ICL codes + audio hash, ~13KB) for reuse |
 | `--load-voice <file>` | - | Reuse profile: skips speaker/codec encoder runs (ICL+11s ref: 79s → 36s wall). Falls back to recompute on audio/ref_text mismatch |
 | `--decode-warmup` | off | Quality path: prepend ref codes so the decoder starts warm (official parity; fixes cold-start attacks, onset HNR 0.55→0.93). Costs decode time ∝ ref length. Default off = fast cold path |
+| `--warmup-frames <n>` | 0 = full | Cap warmup to trailing N ref frames (implies warmup). Smooth tradeoff: 8 layers × 72-frame window ≈ 576-frame effective memory, so k72 ≈ 4x closer to full than cold at ~60% of the cost |
 | `--language <name>` | english | Target language |
 | `--output <path>` | output.wav | Output WAV path |
 | `--max-codes <n>` | 500 | Max code timesteps (~n/12.5 seconds) |
@@ -266,7 +267,7 @@ threading threshold.
 | + AVX2 causal-conv kernel (decode) | 25.7s | 32.7s (decode 13.8s → 4.2s) | -58% total |
 | + GEMV overdecomposition (4x chunks) | 19.1s (0.56s/frame) | 25.6s | -67% total |
 | + integer-arithmetic Q4 LUT | 12.0s (0.35s/frame) | 17.7s | -77% total |
-| + ICL decoder warmup (ref prepend) | same | decode ×~2.5 in ICL mode (official parity; fixes cold-start attacks) | quality fix, costs time |
+| + ICL decoder warmup (ref prepend, opt-in `--decode-warmup`) | same | decode ×~2.5 in ICL mode when enabled (official parity; fixes cold-start attacks) | quality option, off by default |
 
 Bit-identical chain: the first five builds produce identical audio for the same
 seed. Overdecomposition changed FP summation order, so bit-identity is no

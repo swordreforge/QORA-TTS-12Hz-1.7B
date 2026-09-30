@@ -52,6 +52,12 @@ pub struct TTSParams {
     /// attention start warm (official parity; fixes cold-start attacks).
     /// Costs decode time ∝ ref length. false = fast cold path (default).
     pub decode_warmup: bool,
+    /// Cap for warmup context: use only the trailing N ref frames instead of
+    /// the full reference (0 = full prepend per official). The decoder's only
+    /// long-memory part is the 72-frame sliding attention window; Vocos conv
+    /// state flushes within ~2 frames — so trailing-32 ≈ full at ~1/4 cost.
+    /// Ignored unless decode_warmup is set.
+    pub warmup_frames: usize,
 }
 
 impl Default for TTSParams {
@@ -67,6 +73,7 @@ impl Default for TTSParams {
             onset_frames: 0,
             onset_temperature: 0.3,
             decode_warmup: false,
+            warmup_frames: 0,
         }
     }
 }
@@ -469,15 +476,44 @@ pub fn generate_speech(
 
     // Decode to audio
     let t_decode = Instant::now();
+    let warmed: Vec<Vec<u32>>;
+    let warmup_opt: Option<&[Vec<u32>]> = if params.decode_warmup {
+        match ref_codes.as_deref() {
+            Some(rc) if params.warmup_frames > 0 => {
+                warmed = warmup_tail(rc, params.warmup_frames);
+                eprintln!("  Decoder warmup: trailing {} of {} ref frames",
+                    warmed[0].len(), rc[0].len());
+                Some(&warmed)
+            }
+            other => other,
+        }
+    } else {
+        None
+    };
     let audio = crate::decoder::decode_to_audio(
         decoder,
         &all_codes,
-        if params.decode_warmup { ref_codes.as_deref() } else { None },
+        warmup_opt,
     );
     eprintln!("Decode done in {:.1?}", t_decode.elapsed());
 
     eprintln!("Total: {:.1?}", t0.elapsed());
     audio
+}
+
+/// Trailing-K slice of ref codes for decoder warmup (see TTSParams).
+/// k == 0 or k >= frames → full passthrough (official behavior).
+/// Returns owned per-book tails (decoder takes slices; Vec<Vec> can't
+/// sub-slice frames without copying).
+pub fn warmup_tail(codes: &[Vec<u32>], k: usize) -> Vec<Vec<u32>> {
+    if codes.is_empty() {
+        return Vec::new();
+    }
+    let n = codes[0].len();
+    if k == 0 || k >= n {
+        return codes.to_vec();
+    }
+    codes.iter().map(|q| q[q.len() - k..].to_vec()).collect()
 }
 
 /// Write codes in VCOD format (magic + u32 groups + u32 frames + u16 codes,
@@ -655,6 +691,7 @@ mod tests {
             onset_frames: 0,
             onset_temperature: 0.3,
             decode_warmup: false,
+            warmup_frames: 0,
         }
     }
 
@@ -709,6 +746,20 @@ mod tests {
         assert_eq!(frame_temperature(&p, 500), 0.8);
         p.onset_frames = 0;
         assert_eq!(frame_temperature(&p, 0), 0.8); // off by default
+    }
+
+    #[test]
+    fn test_warmup_tail() {
+        let codes = vec![vec![1u32, 2, 3, 4, 5], vec![6u32, 7, 8, 9, 10]];
+        // k=0 → full passthrough
+        assert_eq!(warmup_tail(&codes, 0), codes);
+        // k>=frames → full passthrough
+        assert_eq!(warmup_tail(&codes, 5), codes);
+        assert_eq!(warmup_tail(&codes, 99), codes);
+        // trailing slice
+        assert_eq!(warmup_tail(&codes, 2), vec![vec![4u32, 5], vec![9u32, 10]]);
+        // empty
+        assert!(warmup_tail(&[], 3).is_empty());
     }
 }
 
