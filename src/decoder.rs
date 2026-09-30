@@ -507,11 +507,18 @@ pub fn decode_to_audio(
     let mut t_blk = std::time::Duration::ZERO;
     for (i, vb) in weights.vocos_blocks.iter().enumerate() {
         let s = Instant::now();
+        let mut t_sn = std::time::Duration::ZERO;
+        let mut t_tr = std::time::Duration::ZERO;
+        let mut t_ca = std::time::Duration::ZERO;
         let in_ch = vb.pre_snake_alpha.len();
 
         // SnakeBeta → ConvTranspose1d (causal: right-crop kernel_size - stride)
+        let q = Instant::now();
         signal = snake_beta(&signal, &vb.pre_snake_alpha, &vb.pre_snake_beta, in_ch);
+        t_sn += q.elapsed();
+        let q = Instant::now();
         signal = conv_transpose1d(&signal, &vb.upsample);
+        t_tr += q.elapsed();
         let out_ch = vb.upsample.out_channels;
         let right_crop = vb.upsample.kernel_size - vb.upsample.stride;
         if right_crop > 0 {
@@ -529,16 +536,25 @@ pub fn decode_to_audio(
         // 3 residual units
         for res in &vb.residuals {
             let residual = signal.clone();
+            let q = Instant::now();
             signal = snake_beta(&signal, &res.act1_alpha, &res.act1_beta, out_ch);
+            t_sn += q.elapsed();
+            let q = Instant::now();
             signal = causal_conv1d(&signal, &res.conv1);
+            t_ca += q.elapsed();
+            let q = Instant::now();
             signal = snake_beta(&signal, &res.act2_alpha, &res.act2_beta, out_ch);
+            t_sn += q.elapsed();
+            let q = Instant::now();
             signal = causal_conv1d(&signal, &res.conv2);
+            t_ca += q.elapsed();
             // Add residual
             for j in 0..signal.len() {
                 signal[j] += residual[j];
             }
         }
-        eprintln!("  Vocos block {i}: [{out_ch}, {len}] in {:.1?}", s.elapsed());
+        eprintln!("  Vocos block {i}: [{out_ch}, {len}] in {:.1?} (snake {:.1?}, trans {:.1?}, causal {:.1?})",
+            s.elapsed(), t_sn, t_tr, t_ca);
         t_blk += s.elapsed();
     }
 
