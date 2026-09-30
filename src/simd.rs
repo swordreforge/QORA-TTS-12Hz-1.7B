@@ -514,8 +514,55 @@ pub unsafe fn conv_transpose1d_range_avx2(
 }
 
 // ============================================================
-// F16 GEMV — AVX-512
+// F32 GEMM — AVX2 (8-wide over n)
 // ============================================================
+
+/// AVX2 row-major GEMM micro-block over rows `[m0, m1)`.
+/// C[m,n] += A[m,k]·B[k,n] with k ascending per element — same per-lane
+/// order as scalar `f32_gemv`, so bit-exact. Bias NOT handled here
+/// (caller pre-fills C rows); n-tail scalar.
+/// `c` covers exactly rows m0..m1 (C indexing is m0-relative).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn f32_gemm_block_avx2(
+    a: &[f32],
+    b: &[f32],
+    m0: usize,
+    m1: usize,
+    n: usize,
+    kdim: usize,
+    c: &mut [f32],
+) {
+    for m in m0..m1 {
+        let a_row = m * kdim;
+        let c_row = (m - m0) * n;
+        for k in 0..kdim {
+            let v = *a.get_unchecked(a_row + k);
+            // Zero-skip: matches legacy per-t f32_gemv_bias EXACTLY, including
+            // the -0.0 edge (skip keeps -0.0, adding +0.0 would flip it to +0.0).
+            if v == 0.0 {
+                continue;
+            }
+            let av = _mm256_set1_ps(v);
+            let b_row = k * n;
+            let mut j = 0;
+            while j + 8 <= n {
+                let cv = _mm256_loadu_ps(c.as_ptr().add(c_row + j));
+                let bv = _mm256_loadu_ps(b.as_ptr().add(b_row + j));
+                _mm256_storeu_ps(
+                    c.as_mut_ptr().add(c_row + j),
+                    _mm256_add_ps(cv, _mm256_mul_ps(av, bv)),
+                );
+                j += 8;
+            }
+            while j < n {
+                let c_ptr = c.as_mut_ptr().add(c_row + j);
+                *c_ptr += v * *b.get_unchecked(b_row + j);
+                j += 1;
+            }
+        }
+    }
+}
 
 /// AVX-512 F16 GEMV: input[k] @ weight[k,n] -> output[n].
 /// Uses _mm512_cvtph_ps for f16->f32 and FMA for accumulation.

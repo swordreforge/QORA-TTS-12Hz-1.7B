@@ -420,6 +420,114 @@ fn dw_conv1d_range(
 }
 
 // ============================================================
+// F32 GEMM with fused bias (for ConvNeXt pointwise batching)
+// ============================================================
+
+/// Row-major f32 GEMM with bias-first init:
+/// C[m,n] = bias[m] + Σ_k A[m,k]·B[k,n], k ascending per element.
+/// Same per-element order as per-timestep `f32_gemv_bias` → bit-exact
+/// replacement for ConvNeXt pw1/pw2 loops (kills len× gather/alloc/call
+/// overhead and re-reads weights once instead of len times).
+/// Threaded by m-blocks; AVX2 8-wide over n when available.
+/// (Zero-skip omitted: acc ± 0.0 == acc in all IEEE cases, provably neutral
+/// vs the skipping per-t path — including ±0.0.)
+pub fn f32_gemm_bias(a: &[f32], b: &[f32], bias: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), k * n);
+    assert_eq!(bias.len(), m);
+    let mut c = vec![0.0f32; m * n];
+    if m == 0 || n == 0 {
+        return c;
+    }
+    // bias prefill (row broadcast = "bias first", same as gemv_bias order)
+    for (mi, row) in c.chunks_exact_mut(n).enumerate() {
+        row.fill(bias[mi]);
+    }
+    if k == 0 {
+        return c;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = crate::simd::has_avx2();
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_avx2 = false;
+    let ops = m * n * k;
+    if ops < 500_000 || !use_avx2 {
+        // small or no-SIMD: single-threaded scalar (also the oracle below)
+        f32_gemm_block_scalar(a, b, 0, m, n, k, &mut c);
+        return c;
+    }
+    let n_threads = num_threads().min(m).max(1);
+    let chunk = (m + n_threads - 1) / n_threads;
+    let a_ptr = a.as_ptr() as usize;
+    let b_ptr = b.as_ptr() as usize;
+    let c_ptr = SendPtr(c.as_mut_ptr());
+    let (am, an, ak) = (m, n, k);
+    std::thread::scope(|s| {
+        for tid in 0..n_threads {
+            let m0 = tid * chunk;
+            let m1 = (m0 + chunk).min(m);
+            if m0 >= m1 {
+                break;
+            }
+            let ptr = c_ptr;
+            s.spawn(move || {
+                let (ra, rb, wb) = unsafe {
+                    (
+                        std::slice::from_raw_parts(a_ptr as *const f32, am * ak),
+                        std::slice::from_raw_parts(b_ptr as *const f32, ak * an),
+                        std::slice::from_raw_parts_mut(ptr.add(m0 * an), (m1 - m0) * an),
+                    )
+                };
+                // AVX2 guaranteed here (checked above); wb covers rows
+                // m0..m1 and the kernel indexes it m0-relative.
+                unsafe {
+                    crate::simd::f32_gemm_block_avx2(ra, rb, m0, m1, an, ak, wb);
+                }
+            });
+        }
+    });
+    c
+}
+
+#[inline]
+fn f32_gemm_block_scalar(
+    a: &[f32], b: &[f32],
+    m0: usize, m1: usize, n: usize, k: usize,
+    c: &mut [f32],
+) {
+    // Single-threaded oracle (small sizes / no AVX2): c is the full matrix,
+    // called with m0 = 0. Doubles as the differential-test reference shape
+    // (bias-first, k-ascending — identical order to the AVX2 block).
+    for m in m0..m1 {
+        for kk in 0..k {
+            let av = a[m * k + kk];
+            // Same zero-skip as the AVX2 block and legacy gemv (see above).
+            if av == 0.0 {
+                continue;
+            }
+            let b_row = kk * n;
+            let c_row = m * n;
+            for j in 0..n {
+                c[c_row + j] += av * b[b_row + j];
+            }
+        }
+    }
+}
+
+/// Row-major transpose: [rows, cols] → [cols, rows]. Used to present
+/// ConvNeXt pw weights (stored [k, n] for per-t GEMV) to batched GEMM.
+pub fn transpose2d(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    assert_eq!(src.len(), rows * cols);
+    let mut out = vec![0.0f32; src.len()];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = src[r * cols + c];
+        }
+    }
+    out
+}
+
+// ============================================================
 // SnakeBeta activation
 // ============================================================
 
@@ -591,6 +699,60 @@ mod tests {
         (0..n)
             .map(|_| ((xrng(state) % 2000) as f32 / 1000.0 - 1.0) * mag)
             .collect()
+    }
+
+    /// f32_gemm_bias vs naive same-order reference: bit-identical
+    /// (bias-first, k-ascending; AVX2 lanes preserve per-lane order).    /// Covers odd n (scalar tail) and threaded sizes.
+    #[test]
+    fn test_f32_gemm_bitexact() {
+        fn naive(a: &[f32], b: &[f32], bias: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+            // mirrors legacy per-t f32_gemv_bias EXACTLY (bias-first,
+            // k-ascending, zero-skip): the differential target.
+            let mut c = vec![0.0f32; m * n];
+            for mi in 0..m {
+                for j in 0..n {
+                    let mut s = bias[mi];
+                    for kk in 0..k {
+                        let av = a[mi * k + kk];
+                        if av == 0.0 {
+                            continue;
+                        }
+                        s += av * b[kk * n + j];
+                    }
+                    c[mi * n + j] = s;
+                }
+            }
+            c
+        }
+        let mut st = 4242u64;
+        for (m, n, k) in [(7usize, 13usize, 11usize), (64, 97, 48), (128, 482, 256)] {
+            let mut a = rvec(&mut st, m * k, 1.0);
+            let b = rvec(&mut st, k * n, 0.5);
+            let mut bias = rvec(&mut st, m, 0.1);
+            // exact zeros incl. -0.0, plus -0.0 bias: the skip path must
+            // preserve -0.0 bits exactly like legacy (adding +0.0 flips it)
+            a[0] = 0.0;
+            if a.len() > 1 {
+                a[1] = -0.0;
+            }
+            bias[0] = -0.0;
+            let got = f32_gemm_bias(&a, &b, &bias, m, n, k);
+            let exp = naive(&a, &b, &bias, m, n, k);
+            assert_eq!(got.len(), exp.len());
+            assert!(got.iter().zip(exp.iter()).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "gemm diverged at {m}x{n}x{k}");
+        }
+    }
+
+    #[test]
+    fn test_transpose2d() {
+        // [2,3] → [3,2], exact values
+        let t = transpose2d(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3);
+        assert_eq!(t, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        // roundtrip
+        let mut st = 99u64;
+        let a = rvec(&mut st, 17 * 31, 1.0);
+        assert_eq!(transpose2d(&transpose2d(&a, 17, 31), 31, 17), a);
     }
 
 

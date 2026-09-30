@@ -345,34 +345,28 @@ fn convnext_forward(input: &[f32], stage: &UpsampleStage) -> Vec<f32> {
     // LayerNorm per-timestep across channels
     let normed = layer_norm_channel_first(&dw_out, &stage.norm_w, &stage.norm_b, ch, 1e-5);
 
-    // Pointwise conv1: [ch] → [4*ch] per timestep
+    // Pointwise conv1+2, batched over time (was: per-timestep gather →
+    // scalar f32_gemv → scatter, re-reading weights `length` times).
+    // Layouts already align: normed is row-major [ch, length], pw1_w is
+    // [inner, ch] → one GEMM gives row-major [inner, length] = channel-first.
+    // Same per-element order (bias-first, k-ascending) → bit-exact.
     let inner_dim = stage.pw1_b.len();
-    let mut pw1_out = vec![0.0f32; inner_dim * length];
-    for t in 0..length {
-        // Gather per-timestep input
-        let mut input_t = vec![0.0f32; ch];
-        for c in 0..ch {
-            input_t[c] = normed[c * length + t];
-        }
-        let out_t = f32_gemv_bias(&input_t, &stage.pw1_w, ch, inner_dim, &stage.pw1_b);
-        // Apply GELU and store in channel-first
-        for c in 0..inner_dim {
-            pw1_out[c * length + t] = gelu(out_t[c]);
-        }
+    // pw weights are stored [k, n] for per-t GEMV (W[ic][c]); batched GEMM
+    // needs [inner, ch]: transpose once per decode (ms-level, vs ~1s GEMM).
+    let w1t = crate::conv::transpose2d(&stage.pw1_w, ch, inner_dim);
+    let mut pw1_out = crate::conv::f32_gemm_bias(
+        &w1t, &normed, &stage.pw1_b, inner_dim, length, ch,
+    );
+    // GELU is elementwise (order-free) → in place, still channel-first.
+    for v in pw1_out.iter_mut() {
+        *v = gelu(*v);
     }
 
-    // Pointwise conv2: [4*ch] → [ch] per timestep
-    let mut pw2_out = vec![0.0f32; ch * length];
-    for t in 0..length {
-        let mut input_t = vec![0.0f32; inner_dim];
-        for c in 0..inner_dim {
-            input_t[c] = pw1_out[c * length + t];
-        }
-        let out_t = f32_gemv_bias(&input_t, &stage.pw2_w, inner_dim, ch, &stage.pw2_b);
-        for c in 0..ch {
-            pw2_out[c * length + t] = out_t[c];
-        }
-    }
+    // Pointwise conv2: [4*ch] → [ch], same batching (output already [ch, length]).
+    let w2t = crate::conv::transpose2d(&stage.pw2_w, inner_dim, ch);
+    let pw2_out = crate::conv::f32_gemm_bias(
+        &w2t, &pw1_out, &stage.pw2_b, ch, length, inner_dim,
+    );
 
     // gamma * output + residual
     let mut output = vec![0.0f32; ch * length];
