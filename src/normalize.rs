@@ -18,7 +18,25 @@
 //! - underscores inside words → space (no_grad → no grad)
 //! - standalone True/False/None → 真/假/空 (Python booleans read naturally)
 //! - sentence dots (followed by space/end/punct) are kept for prosody
+//! v3 adds universal cleaning FIRST (all languages via normalize_for_language):
+//! - invisible junk deleted: zero-width (U+200B/C/D), BOM (U+FEFF), bidi
+//!   controls (U+200E/F, U+202A-2E, U+2060-69), variation selectors
+//!   (U+FE00-0F incl. emoji VS16, U+E0000-7F tags, U+E0100-1FD),
+//!   keycap joiner (U+20E3), emoji pictographs (U+1F000-1FAFF)
+//! - control chars deleted except \n \r \t (which shape chunking/prosody)
+//! - horizontal whitespace runs collapsed to one space (space/tab/VT/FF/
+//!   NBSP/U+3000; newlines untouched — the splitter owns them)
+//! - light markdown: `ticks`→content, line-start #/>/list markers stripped,
+//!   --- hr lines dropped, [text](url)→text, paired **/__/~~/*…* stripped
+//!   (content kept), | → space
+//! Boundaries (documented, not bugs): ZWJ/ZWNJ deletion assumes CJK/EN
+//! corpus (Indic scripts use ZWJ orthographically); dingbats/misc-symbols
+//! (★☎♥) are KEPT (often meaningful); lowercase true/false untouched.
 //! Anything unrecognized passes through byte-identical.
+//!
+//! Panic-safety contract: this file NEVER slices &str by byte index.
+//! Everything runs on Vec<char> with bounds-checked indexing, so CJK
+//! (multi-byte UTF-8) cannot split mid-codepoint. Keep it that way.
 
 const D: [&str; 10] = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
 
@@ -98,8 +116,249 @@ fn digitwise(s: &str) -> String {
     s.chars().map(|c| D[c.to_digit(10).unwrap() as usize]).collect()
 }
 
+/// Universal cleaning v3: invisible junk, controls, whitespace, light markdown.
+/// Runs FIRST for every language (numbers/code rules see clean text).
+/// Char-scan only — no byte slicing anywhere (see module panic contract).
+pub fn clean(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    // collapse horizontal whitespace runs (space-like class → one ' ');
+    // leading/trailing runs vanish (flush only between content)
+    let mut pend_space = false;
+    let flush_space = |out: &mut String, pend: &mut bool| {
+        if *pend {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            *pend = false;
+        }
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        // --- markdown line constructs (only at line start) ---
+        if i == 0 || chars[i - 1] == '\n' {
+            let mut j = i;
+            while j < chars.len() && (chars[j] == ' ' || chars[j] == '\t') {
+                j += 1;
+            }
+            // hr: line of only [-*_ \t], ≥3 markers → drop whole line
+            let mut k = j;
+            let mut marks = 0;
+            while k < chars.len() && chars[k] != '\n'
+                && matches!(chars[k], '-' | '*' | '_' | ' ' | '\t')
+            {
+                if matches!(chars[k], '-' | '*' | '_') {
+                    marks += 1;
+                }
+                k += 1;
+            }
+            if marks >= 3 && (k >= chars.len() || chars[k] == '\n') {
+                i = k; // skip to \n (kept next iteration) or end
+                pend_space = false;
+                continue;
+            }
+            // headers: 1-6 '#' + space/EOL (one following space eaten)
+            if chars[j] == '#' {
+                let mut h = j;
+                while h < chars.len() && chars[h] == '#' && h - j < 6 {
+                    h += 1;
+                }
+                if h == chars.len() || chars[h] == ' ' || chars[h] == '\t' || chars[h] == '\n' {
+                    i = h;
+                    if i < chars.len() && (chars[i] == ' ' || chars[i] == '\t') {
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+            // quote: '>' + space/EOL (one following space eaten)
+            if chars[j] == '>'
+                && (j + 1 >= chars.len()
+                    || chars[j + 1] == ' '
+                    || chars[j + 1] == '\t'
+                    || chars[j + 1] == '\n')
+            {
+                i = j + 1;
+                if i < chars.len() && (chars[i] == ' ' || chars[i] == '\t') {
+                    i += 1;
+                }
+                continue;
+            }
+            // list: single -/+/* + space/EOL ("-40dB" has no space → safe)
+            if matches!(chars[j], '-' | '+' | '*')
+                && (j + 1 >= chars.len()
+                    || chars[j + 1] == ' '
+                    || chars[j + 1] == '\t'
+                    || chars[j + 1] == '\n')
+            {
+                i = j + 1;
+                if i < chars.len() && (chars[i] == ' ' || chars[i] == '\t') {
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        // --- invisible junk: delete ---
+        if is_invisible(c) {
+            i += 1;
+            continue;
+        }
+        // --- controls (keep \n \r \t) ---
+        if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
+            i += 1;
+            continue;
+        }
+        // --- horizontal whitespace → collapse ---
+        if c == ' ' || c == '\t' || c == '\x0B' || c == '\x0C' || c == '\u{A0}' || c == '\u{3000}' {
+            pend_space = true;
+            i += 1;
+            continue;
+        }
+        flush_space(&mut out, &mut pend_space);
+        // --- backtick: always junk, drop the tick, keep content ---
+        if c == '`' {
+            i += 1;
+            continue;
+        }
+        // --- pipe: table border / shell pipe → neutral space ---
+        if c == '|' {
+            out.push(' ');
+            i += 1;
+            continue;
+        }
+        // --- [text](url) → text (malformed → all literal) ---
+        if c == '[' {
+            if let Some((end, inner)) = try_link(&chars, i) {
+                flush_space(&mut out, &mut pend_space);
+                out.push_str(&inner);
+                i = end;
+                continue;
+            }
+        }
+        // --- paired markers **/__/~~ (and single *…*, never single _…_) ---
+        if (c == '*' || c == '~') || (c == '_' && i + 1 < chars.len() && chars[i + 1] == '_') {
+            let marker: &str = if c == '_' {
+                "__"
+            } else if c == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+                "**"
+            } else if c == '~' && i + 1 < chars.len() && chars[i + 1] == '~' {
+                "~~"
+            } else if c == '*' {
+                "*"
+            } else {
+                ""
+            };
+            if !marker.is_empty() {
+                if let Some((end, inner)) = try_paired(&chars, i, marker) {
+                    flush_space(&mut out, &mut pend_space);
+                    out.push_str(&inner);
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Invisible characters deleted by clean(). ZWJ/ZWNJ included by instruction
+/// (CJK/EN corpus assumption — Indic scripts use ZWJ orthographically).
+/// Dingbats/misc-symbols (★☎♥ U+2600-27BF) deliberately NOT here (kept).
+fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{200B}' | '\u{200C}' | '\u{200D}' | // ZWSP, ZWNJ, ZWJ
+        '\u{FEFF}' | // BOM / ZWNBSP
+        '\u{200E}' | '\u{200F}' | // bidi marks
+        '\u{202A}'..='\u{202E}' | // bidi embeddings/overrides
+        '\u{2060}'..='\u{2069}' | // word joiner, invisible ops, bidi isolates
+        '\u{FE00}'..='\u{FE0F}' | // variation selectors (incl. VS16)
+        '\u{E0000}'..='\u{E007F}' | // tag characters
+        '\u{E0100}'..='\u{E01FD}' | // IVS
+        '\u{20E3}' // combining enclosing keycap
+    ) || ('\u{1F000}'..='\u{1FAFF}').contains(&c) // emoji blocks
+}
+
+/// Parse [text](url) at chars[i]=='['. Returns (index past ')', inner text).
+/// Newlines/nesting rejected; malformed input → None (emit literally).
+fn try_link(chars: &[char], i: usize) -> Option<(usize, String)> {
+    let mut j = i + 1;
+    while j < chars.len() && chars[j] != ']' && chars[j] != '\n' && chars[j] != '[' {
+        j += 1;
+    }
+    if j >= chars.len() || chars[j] != ']' || j + 1 >= chars.len() || chars[j + 1] != '(' {
+        return None;
+    }
+    let inner: String = chars[i + 1..j].iter().collect();
+    if inner.is_empty() || inner.chars().count() > 200 {
+        return None;
+    }
+    let mut k = j + 2;
+    while k < chars.len() && chars[k] != ')' && chars[k] != '\n' && chars[k] != ' ' && chars[k] != '\t' {
+        k += 1;
+    }
+    if k >= chars.len() || chars[k] != ')' {
+        return None;
+    }
+    Some((k + 1, inner))
+}
+
+/// Strip a paired marker (opener at i). Content rules: non-empty, same line,
+/// ≤60 chars, no marker char inside (nearest-close pairing), and must look
+/// like prose — contains an ASCII letter or CJK char (so "2**3" / "**2**"
+/// fall through to the arithmetic rules instead of being eaten).
+/// Single '_' is NEVER paired here (snake_case glue owns it downstream).
+fn try_paired(chars: &[char], i: usize, marker: &str) -> Option<(usize, String)> {
+    let m: Vec<char> = marker.chars().collect();
+    let ml = m.len();
+    if chars[i..].len() < ml * 2 + 1 {
+        return None;
+    }
+    // find nearest closer on the same line
+    let mut k = i + ml;
+    let mut found = None;
+    while k + ml <= chars.len() && chars[k] != '\n' && k - (i + ml) <= 60 {
+        if chars[k..].starts_with(&m) {
+            found = Some(k);
+            break;
+        }
+        // a lone same-head char inside aborts ("*a*b*c" pairs a-b first,
+        // which is correct nearest-close; but "**a**" handled by ml=2 scan)
+        k += 1;
+    }
+    let e = found?;
+    let inner: String = chars[i + ml..e].iter().collect();
+    if inner.is_empty() {
+        return None;
+    }
+    let mhead = m[0];
+    if inner.contains(mhead) {
+        return None;
+    }
+    // strikethrough applies to anything; emphasis needs prose evidence
+    if marker != "~~"
+        && !inner.chars().any(|c| c.is_ascii_alphabetic() || is_cjk(c))
+    {
+        return None;
+    }
+    Some((e + ml, inner))
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{4E00}'..='\u{9FFF}' | // CJK unified
+        '\u{3400}'..='\u{4DBF}' | // ext A
+        '\u{3040}'..='\u{309F}' | // hiragana
+        '\u{30A0}'..='\u{30FF}' | // katakana
+        '\u{AC00}'..='\u{D7AF}' // hangul
+    )
+}
+
 /// Normalize one text. Idempotent-ish for already-Chinese prose.
 pub fn normalize(text: &str) -> String {
+    let text = clean(text);
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -287,15 +546,16 @@ fn parse_number(chars: &[char], i: usize, force_dw: bool) -> (String, usize) {
     (word, j)
 }
 
-/// Language-aware entry: Chinese and Japanese get number normalization,
-/// other languages pass through (English number words are future work).
+/// Language-aware entry: v3 cleaning is universal (all languages);
+/// Chinese adds numbers+code, Japanese its own rules, English passes
+/// through otherwise (cleaning only).
 pub fn normalize_for_language(text: &str, language: &str) -> String {
     if language.eq_ignore_ascii_case("chinese") {
         normalize(text)
     } else if language.eq_ignore_ascii_case("japanese") {
-        crate::normalize_ja::normalize(text)
+        crate::normalize_ja::normalize(&clean(text))
     } else {
-        text.to_string()
+        clean(text)
     }
 }
 
@@ -415,5 +675,74 @@ mod tests {
         assert_eq!(normalize_for_language("4月1日", "japanese"), "シガツツイタチ");
         assert_eq!(normalize_for_language("4月1日", "english"), "4月1日");
         assert_eq!(normalize_for_language("2020年", "japanese"), "ニセンニジュウネン");
+    }
+
+    #[test]
+    fn test_clean_invisible() {
+        assert_eq!(clean("a​b‍c﻿d"), "abcd"); // ZWSP ZWJ BOM
+        assert_eq!(clean("a\u{202A}b\u{202E}c\u{2066}d\u{2069}e"), "abcde"); // bidi controls
+        assert_eq!(clean("a︀b️c"), "abc"); // VS1 + VS16
+        // emoji pictographs gone (incl. ZWJ family glue, keycap, tags)
+        assert_eq!(clean("好吃😂"), "好吃");
+        assert_eq!(clean("👨‍👩‍👧"), "");
+        assert_eq!(clean("按1⃣确认"), "按1确认");
+        // dingbats/misc-symbols KEPT (documented boundary)
+        assert_eq!(clean("五星★★★★★"), "五星★★★★★");
+        assert_eq!(clean("电话☎"), "电话☎");
+    }
+
+    #[test]
+    fn test_clean_controls_and_space() {
+        assert_eq!(clean("a\0b\x07c\x7Fd\u{80}e"), "abcde");
+        assert_eq!(clean("a\nb\rc\td"), "a\nb\rc d"); // \n\r kept; tab folds to space
+        assert_eq!(clean("a   b\t\tc\u{3000}\u{3000}d\u{A0}e"), "a b c d e");
+        assert_eq!(clean("  首尾空格  "), "首尾空格");
+    }
+
+    #[test]
+    fn test_clean_markdown() {
+        assert_eq!(clean("用`code`表示"), "用code表示");
+        assert_eq!(clean("# 标题"), "标题");
+        assert_eq!(clean("### 深标题"), "深标题");
+        assert_eq!(clean("> 引用"), "引用");
+        assert_eq!(clean("- 列表项"), "列表项");
+        assert_eq!(clean("C#语言"), "C#语言"); // mid-line # kept
+        assert_eq!(clean("a>b"), "a>b");
+        assert_eq!(clean("**粗体**和*斜体*"), "粗体和斜体");
+        assert_eq!(clean("__init__"), "init");
+        assert_eq!(clean("~~删除~~"), "删除");
+        assert_eq!(clean("看[文档](http://x.y/z)吧"), "看文档吧");
+        assert_eq!(clean("[坏链接"), "[坏链接");
+        assert_eq!(clean("a|b"), "a b");
+        assert_eq!(clean("---\n正文"), "\n正文");
+        // arithmetic guards: single markers still mean math downstream
+        assert_eq!(normalize("2*3"), "二乘三");
+        assert_eq!(normalize("**2**"), "乘乘二乘乘"); // no prose → untouched
+    }
+
+    #[test]
+    fn test_clean_no_panic_multibyte_soup() {
+        // every rule trigger adjacent to multi-byte CJK (byte-slicing here
+        // would panic mid-codepoint); must survive + converge.
+        let soup = "中​文😂a.b_c­d\u{202E}**重**[链](u)　　3.5% True\n# 标`题`";
+        let mut s = soup.to_string();
+        for _ in 0..3 {
+            s = normalize(&s);
+        }
+        let again = normalize(&s);
+        assert_eq!(s, again); // fixed point, no panic
+        assert!(!s.contains('\u{200B}'));
+        assert!(!s.chars().any(|c| ('\u{1F000}'..='\u{1FAFF}').contains(&c)));
+    }
+
+    #[test]
+    fn test_clean_idempotent_and_passthrough() {
+        let nasty = "# 标​题\n- `a.b` 用True😂  3.5%  **x** [t](u) a|b ---";
+        let once = normalize(nasty);
+        assert_eq!(normalize(&once), once);
+        assert_eq!(normalize("你好，世界。"), "你好，世界。");
+        // v2 suspect sentence unchanged by v3 (no v3 chars in it)
+        let s = "当 torch点backends点cudnn点benchmark 设置为 真 时。";
+        assert_eq!(normalize(s), s);
     }
 }

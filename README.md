@@ -80,7 +80,11 @@ Chinese input is automatically number-normalized before synthesis
 code tokens are stabilized after numbers (`torch.no_grad` → `torch点no grad`,
 standalone `True`/`False`/`None` → `真`/`假`/`空`, sentence dots kept) —
 code-dense text otherwise stutters on every dot and can wander into
-silence defects;
+silence defects; universal v3 cleaning runs first in every language
+(zero-width/BOM/bidi/variation-selectors/emoji-pictographs/controls
+deleted, whitespace collapsed, light markdown stripped:
+`` `code` `` → `code`, `# ` / `> ` / `- ` line markers, `---` rules,
+`[text](url)` → `text`, paired `**`/`__`/`~~`/`*…*`);
 Japanese gets the same treatment with its own rules
 (`4月1日` → `シガツツイタチ`, `35%` → `サンジュウゴパーセント`,
 `2020年` → `ニセンニジュウネン`).
