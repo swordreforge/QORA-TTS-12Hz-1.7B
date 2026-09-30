@@ -278,16 +278,31 @@ longer guaranteed in general — this run happened to be bit-identical
 
 ### Hybrid-CPU note (Intel Ultra 7 155H: 6P + 8E + 2LP-E)
 
-The pool splits work evenly, so join barriers wait for 2.5GHz LP-E cores while
-22 active cores also drag P-core clocks down. Pinning to P-cores only:
+Default (22 workers, no pinning) is the fastest overall configuration on the
+current build — re-measured 2026-09-30, quiet machine, fat-LTO binary:
+
+- two2 end-to-end: all-core 19.5s (6.7/7.7/5.0) vs P-only
+  (`taskset -c 0-11`, `QORA_THREADS=12`) 23.4s (7.7/8.0/7.7).
+  Generation ties; decode is much faster with E-cores helping (5.0 vs 7.7s).
+- decode-only 241f: all-core 29.5s vs P+E (`taskset -c 0-19`) 29.2s —
+  LP-E exclusion is noise (±1%), not worth managing.
+- The old P-only advice (18.3s, thin-LTO era) no longer holds; the
+  "barrier waits for LP-E" premise died with 4x overdecomposition
+  (shared queue, fast cores pull more chunks; measured migrations = 0).
+
+Threading guidance:
 
 ```bash
-taskset -c 0-11 ./target/release/qora-tts --ref-audio ...  # gen 19.1s → 10.8s, total 25.6s → 18.3s
+./target/release/qora-tts ...   # default: use all cores, fastest overall
+QORA_THREADS=12 ...             # only when sharing the box (fewer workers,
+                                # portable); taskset optional for isolation,
+                                # not for speed
 ```
 
-(`QORA_THREADS=N` overrides pool size portably, but only `taskset`/affinity
-keeps threads off E-cores. Note: decode convs scale with thread count, so
-P-only pinning speeds generation but slows decode 4.2s → 6.4s.)
+Scheduling/VM micro-avenues measured and closed (2026-09-30, decode-only
+241f): minor faults 204k (≈1% wall, fresh-Vec zeroing), dTLB misses ~1.2M
+(≈0.01s), migrations 0, THP already `always`. No code changes justified;
+`madvise`/affinity/pinning would chase ~1%.
 
 ### FMA evaluation (measured, kept opt-in)
 
