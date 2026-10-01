@@ -370,6 +370,24 @@ cargo build --release
 
 Pre-built binaries via GitHub Actions for Windows x86_64, Linux x86_64, macOS aarch64.
 
+### Portable vs native builds
+
+Two flavors, bit-identical output (sha-verified: generic and native builds
+produce identical WAVs — AVX2 kernels are runtime-dispatched, autovec
+differences don't flip bits here):
+
+```bash
+./scripts/build-release.sh [triple]   # portable: generic x86-64, isolated
+                                      # target/<triple>/release/, never touches
+                                      # your target/release/ native build.
+                                      # Assembles dist/ (2.2GB) + sha256sums
+                                      # + --check self-test.
+RUSTFLAGS="-C target-cpu=native" cargo build --release --bin qora-tts
+                                      # personal best-performance build.
+```
+
+Ship the portable one; build native locally for speed.
+
 ## Model Binary Format (.qora-tts)
 
 Custom binary format for fast loading:
