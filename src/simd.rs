@@ -10,6 +10,7 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+#[allow(unused_imports)] // non-x86_64 cfgs out most fns using this (CI hygiene)
 use half::f16;
 
 const Q4_GROUP_SIZE: usize = 32;

@@ -478,11 +478,19 @@ pub fn f32_gemm_bias(a: &[f32], b: &[f32], bias: &[f32], m: usize, n: usize, k: 
                         std::slice::from_raw_parts_mut(ptr.add(m0 * an), (m1 - m0) * an),
                     )
                 };
-                // AVX2 guaranteed here (checked above); wb covers rows
-                // m0..m1 and the kernel indexes it m0-relative.
-                unsafe {
-                    crate::simd::f32_gemm_block_avx2(ra, rb, m0, m1, an, ak, wb);
+                // x86_64: AVX2 block (checked above, wb m0-relative).
+                // Elsewhere: scalar chunks (same order, same bits).
+                // NOTE: non-x86_64 never reaches here today (`!use_avx2`
+                // takes the single-threaded path above); the fallback
+                // exists so the threaded shape stays compilable everywhere.
+                #[cfg(target_arch = "x86_64")]
+                if use_avx2 {
+                    unsafe {
+                        crate::simd::f32_gemm_block_avx2(ra, rb, m0, m1, an, ak, wb);
+                    }
+                    return;
                 }
+                f32_gemm_block_scalar(ra, rb, m0, m1, an, ak, wb);
             });
         }
     });
@@ -495,9 +503,10 @@ fn f32_gemm_block_scalar(
     m0: usize, m1: usize, n: usize, k: usize,
     c: &mut [f32],
 ) {
-    // Single-threaded oracle (small sizes / no AVX2): c is the full matrix,
-    // called with m0 = 0. Doubles as the differential-test reference shape
-    // (bias-first, k-ascending — identical order to the AVX2 block).
+    // Scalar oracle (small sizes / no AVX2 / non-x86_64 fallback): c covers
+    // rows m0..m1 (m0-relative indexing; single-threaded callers pass the
+    // full matrix with m0 = 0). Doubles as the differential-test reference
+    // shape (bias-first, k-ascending — identical order to the AVX2 block).
     for m in m0..m1 {
         for kk in 0..k {
             let av = a[m * k + kk];
@@ -506,7 +515,7 @@ fn f32_gemm_block_scalar(
                 continue;
             }
             let b_row = kk * n;
-            let c_row = m * n;
+            let c_row = (m - m0) * n;
             for j in 0..n {
                 c[c_row + j] += av * b[b_row + j];
             }

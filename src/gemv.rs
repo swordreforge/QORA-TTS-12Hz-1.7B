@@ -185,7 +185,8 @@ fn gemv_f16(input: &[f32], weight: &F16Weight) -> Vec<f32> {
     let n = weight.n;
     let w = &weight.data;
 
-    // AVX-512 fast path
+    // AVX-512 fast path (x86_64-only symbol: cfg-gated, scalar fallback below)
+    #[cfg(target_arch = "x86_64")]
     if crate::simd::has_avx512() {
         return unsafe { crate::simd::gemv_f16_avx512(input, w, k, n) };
     }
@@ -228,11 +229,13 @@ fn gemm_f16(x: &[f32], seq_len: usize, weight: &F16Weight) -> Vec<f32> {
 #[inline]
 fn gemv_q4_inner(input: &[f32], packed: &[u8], scales: &[f16],
                   _k: usize, n: usize, k_start: usize, k_end: usize) -> Vec<f32> {
-    // AVX-512 fast path
+    // AVX-512 fast path (x86_64-only symbol: cfg-gated, scalar fallback below)
+    #[cfg(target_arch = "x86_64")]
     if crate::simd::has_avx512() {
         return unsafe { crate::simd::gemv_q4_avx512(input, packed, scales, n, k_start, k_end) };
     }
-    // AVX2 fast path
+    // AVX2 fast path (same gating rule)
+    #[cfg(target_arch = "x86_64")]
     if crate::simd::has_avx2() {
         return unsafe { crate::simd::gemv_q4_avx2(input, packed, scales, n, k_start, k_end) };
     }
