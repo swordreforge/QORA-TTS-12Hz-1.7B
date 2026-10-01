@@ -1,6 +1,7 @@
 
 
-# QORA-TTS 1.7B - Pure Rust Text-to-Speech with Voice Cloning(Forked version from https://github.com/incordlabs/QORA-TTS-12Hz-1.7B)
+# QORA-TTS 1.7B - Pure Rust Text-to-Speech with Voice Cloning [incordlabs/QORA-TTS-12Hz-1.7B](https://github.com/incordlabs/QORA-TTS-12Hz-1.7B)
+
 
 Pure Rust TTS engine with voice cloning. No Python, no CUDA, no external ML frameworks. Single executable + model weights = portable text-to-speech that runs on any machine.
 
