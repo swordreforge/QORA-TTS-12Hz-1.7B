@@ -22,11 +22,15 @@ fn global_pool() -> &'static Pool {
             .unwrap_or(6)
             .max(1);
         // QORA_THREADS overrides pool size (e.g. pin to P-cores).
+        // Default caps at 16: measured saturation (two2/54f, ×2 runs each) —
+        // 16: 6.9/7.0s, 20: 7.6s, 22: 7.6/7.6s. Past 16 the shared-queue
+        // mutex + LP-E tails cost more than extra workers give (memory-bound
+        // GEMV + small predictor GEMVs stop scaling ~12-16).
         let workers = std::env::var("QORA_THREADS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n >= 1)
-            .unwrap_or(avail);
+            .unwrap_or(avail.min(16));
         let actual = workers.min(avail * 2).max(1);
         let (tx, rx) = mpsc::channel::<(Job, mpsc::Sender<Vec<f32>>)>();
         let rx = Arc::new(Mutex::new(rx));

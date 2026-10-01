@@ -298,14 +298,28 @@ current build — re-measured 2026-09-30, quiet machine, fat-LTO binary:
   "barrier waits for LP-E" premise died with 4x overdecomposition
   (shared queue, fast cores pull more chunks; measured migrations = 0).
 
-Threading guidance:
+Threading guidance (re-measured 2026-10-01, thread scan 1/2/4/8/12/16/20/22
+on two2/54f, ×2 runs at 16/22):
+
+- talker: 10.1 → 3.1s (1→16 threads, then flat)
+- predictor: 8.8 → 3.8s (1→12 threads, then flat — per-step small-GEMV
+  work-size wall, not barrier waste: 1→2→4 scales ~linearly)
+- 16 wins twice: 6.9/7.0s vs 20: 7.6s vs 22: 7.6/7.6s → **default is 16**
 
 ```bash
-./target/release/qora-tts ...   # default: use all cores, fastest overall
-QORA_THREADS=12 ...             # only when sharing the box (fewer workers,
-                                # portable); taskset optional for isolation,
-                                # not for speed
+./target/release/qora-tts ...   # default: 16 workers (see gpool.rs)
+QORA_THREADS=N ...              # override (1/2/4/8 for sharing the box,
+                                # higher only for benchmarking)
 ```
+
+Position→ms/frame trace (GPT deep-water C, always-on one line per 50
+frames): 311f chunk 128→168ms/f, 376f chunk ~140→174ms/f (+30% over
+350 frames — KV/attention context scaling, mild). Bounded by the merge
+cap (~150 chars) so no action; sliding-window talker attention would
+change model math for prosody coherence — not worth it.
+Note: prefill GEMM (`gemm_q4`) still keys off raw
+`available_parallelism`, not the pool cap — left alone (12% slice,
+no data either way).
 
 Scheduling/VM micro-avenues measured and closed (2026-09-30, decode-only
 241f): minor faults 204k (≈1% wall, fresh-Vec zeroing), dTLB misses ~1.2M

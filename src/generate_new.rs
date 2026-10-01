@@ -667,6 +667,11 @@ pub fn generate_speech(
         if frame_idx % 10 == 0 {
             eprint!("\rGenerating frame {}/{}...", frame_idx + 1, params.max_codes);
         }
+        // Position→ms/frame trace (GPT deep-water C): one line per 50 frames
+        // with wall elapsed — slope reveals KV/attention context scaling.
+        if frame_idx % 50 == 49 {
+            eprintln!("\n[pos-trace] frame {} t={:.1?}", frame_idx + 1, t_gen.elapsed());
+        }
     }
 
     eprintln!("\nGeneration done in {:.1?} ({} frames, talker {:.1?}, predictor {:.1?})",
