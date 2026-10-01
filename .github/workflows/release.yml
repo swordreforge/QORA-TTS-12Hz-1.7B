@@ -24,7 +24,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build
-        run: cargo build --release
+        # --bins (not --bin qora-tts): packaging below expects BOTH binaries.
+        # A narrowed build command is exactly how "tar: compress_model:
+        # Cannot stat" happens with a green build step.
+        run: cargo build --release --bins
+
+      - name: Verify artifacts (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          test -x target/release/qora-tts || { echo "MISSING target/release/qora-tts"; exit 1; }
+          test -x target/release/compress_model || { echo "MISSING target/release/compress_model"; exit 1; }
+
+      - name: Verify artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path target\release\qora-tts.exe)) { throw "MISSING target\release\qora-tts.exe" }
+          if (-not (Test-Path target\release\compress_model.exe)) { throw "MISSING target\release\compress_model.exe" }
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
