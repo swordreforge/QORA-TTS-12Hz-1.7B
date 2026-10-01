@@ -1,6 +1,6 @@
 
 
-# QORA-TTS 1.7B - Pure Rust Text-to-Speech with Voice Cloning
+# QORA-TTS 1.7B - Pure Rust Text-to-Speech with Voice Cloning(Forked version from )
 
 Pure Rust TTS engine with voice cloning. No Python, no CUDA, no external ML frameworks. Single executable + model weights = portable text-to-speech that runs on any machine.
 
